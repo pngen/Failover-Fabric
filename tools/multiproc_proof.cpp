@@ -616,11 +616,114 @@ static int run_stateful(const std::string& dir, const char* worker_exe) {
   return ok ? 0 : 1;
 }
 
+// ------------------------------------------------------------------------- //
+// Scenario: activation-acknowledgment crash atomicity. A real worker (B) ACCEPTS activation
+// (sets its active flag) but WITHHOLDS the ACTIVATE_RESULT; the coordinator's synchronous
+// activate RPC hangs and the coordinator is terminated before recording the activation. The
+// surviving worker B re-registers; on restart the coordinator must advance the epoch, reject
+// the stale old authority, reconcile the activated survivor WITHOUT a duplicate exclusive
+// authority (the interrupted pending replacement is never prematurely promoted) and complete a
+// fresh routed verified recovery through the survivor.
+// ------------------------------------------------------------------------- //
+std::uint16_t find_free_port() {
+  sock s = net::tcp_listen(0);
+  if (s == net::kInvalidSocket) return 0;
+  std::uint16_t p = net::tcp_listen_port(s);
+  net::close_socket(s);
+  return p;
+}
+bool file_exists(const std::string& p) { FILE* fp = fopen(p.c_str(), "r"); if (fp) { fclose(fp); return true; } return false; }
+bool wait_for_file(const std::string& p, int tries = 200) {
+  for (int i = 0; i < tries; ++i) { if (file_exists(p)) return true; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+  return false;
+}
+// Send EXECUTE_FAILOVER without waiting for the reply (the coordinator is expected to hang in
+// the activate RPC because the worker withholds the acknowledgment).
+void fire_execute_failover(std::uint16_t cport, std::uint64_t service) {
+  sock c = net::tcp_connect("127.0.0.1", cport);
+  if (c == net::kInvalidSocket) return;
+  { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
+  PayloadWriter w; w.u64(ex::fid::service, service);
+  send1(c, MsgType::EXECUTE_FAILOVER, 7120, 0, w.finish());
+  net::close_socket(c);
+}
+static int run_activation_crash(const std::string& dir, const char* worker_exe) {
+  auto exe = [&](const char* n) { return dir + "\\" + n; };
+  const std::uint64_t SVC = 1, A = 10, B = 11;
+  const char* ckpt = "coord_act.ff";
+  const char* marker = "activate_withheld_11.out";   // target 11 (B) writes it upon activation-withhold
+  std::remove(ckpt); std::remove(marker);
+  std::uint16_t tport = find_free_port();
+  if (!tport) { std::fprintf(stderr, "activation_crash: no free port\n"); return 1; }
+  std::string tcport = "127.0.0.1:" + std::to_string(tport);
+  Proc coord = spawn(exe("ff_coordinator.exe"), {"--port", std::to_string(tport), "--checkpoint", ckpt});
+  std::uint16_t cport = read_port(coord.pipe); if (cport != tport) { std::fprintf(stderr, "activation_crash: no cport\n"); return 1; }
+  Proc gateway = spawn(exe("ff_gateway.exe"), {"--coordinator", tcport, "--port", "0", "--boot", "1"});
+  std::uint16_t gport = read_port(gateway.pipe);
+  (void)gport;
+  Proc wa = spawn(exe(worker_exe), {"--coordinator", tcport, "--port", "0", "--target", std::to_string(A), "--boot", std::to_string(A)});
+  (void)read_port(wa.pipe);
+  Proc wb = spawn(exe(worker_exe), {"--coordinator", tcport, "--port", "0", "--target", std::to_string(B), "--boot", std::to_string(B), "--withhold-activate", "--reconnect"});
+  (void)read_port(wb.pipe);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A); coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::target, A); w.u8(ex::fid::category, (std::uint8_t)FailureCategory::PROCESS_EXIT); w.u64(ex::fid::seq, 1); coord_rpc(cport, MsgType::PUBLISH_FAILURE, w.finish(), t, d); }
+
+  // Trigger the failover; the coordinator hangs in the activate RPC while B withholds the ack.
+  fire_execute_failover(cport, SVC);
+  bool ack_withheld = wait_for_file(marker);
+  if (!ack_withheld) { std::fprintf(stderr, "activation_crash: activation ack never withheld\n"); kill_proc(coord); kill_proc(gateway); kill_proc(wa); kill_proc(wb); return 1; }
+  // Coordinator dies BEFORE recording the activation; worker B survives (still active).
+  kill_proc(coord); kill_proc(gateway);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // Restart the coordinator on the SAME port; the survivor B re-registers via reconnection.
+  Proc coord2 = spawn(exe("ff_coordinator.exe"), {"--port", std::to_string(tport), "--load", ckpt, "--checkpoint", ckpt});
+  std::uint16_t cport2 = read_port(coord2.pipe); if (cport2 != tport) { std::fprintf(stderr, "activation_crash: no cport2\n"); return 1; }
+  Proc g2 = spawn(exe("ff_gateway.exe"), {"--coordinator", tcport, "--port", "0", "--boot", "2"});
+  std::uint16_t gport2 = read_port(g2.pipe);
+
+  // Reconciliation evidence: epoch advanced, the interrupted cutover is incomplete (not verified),
+  // stale authority (A) rejected, and the pending replacement was NOT prematurely promoted.
+  QueryResult qr = query_state(cport2, SVC);
+  bool epoch_advanced = (qr.epoch > 1);
+  bool revalidation = qr.revalidation;
+  bool incomplete = qr.txn_incomplete;
+  bool old_epoch_rejected = stale_result_rejected(cport2, SVC, A, 1, 1, 9000);
+  QueryResult qr2 = query_state(cport2, SVC);
+  bool no_premature_authority = qr2.txn_incomplete || qr2.revalidation;
+
+  // Fresh recovered verification through the activated survivor (B). Retry briefly so the
+  // surviving worker B has re-registered with the restarted coordinator.
+  bool recovered = false; std::string rdet; MsgType rt;
+  for (int attempt = 0; attempt < 60 && !recovered; ++attempt) {
+    PayloadWriter w; w.u64(ex::fid::service, SVC);
+    if (coord_rpc(cport2, MsgType::EXECUTE_FAILOVER, w.finish(), rt, rdet)) recovered = true;
+    else std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  }
+  QueryResult qr3 = query_state(cport2, SVC);
+  bool current_b = (qr3.target == B);
+  std::uint64_t rv = 0;
+  bool routed_ok = gport2 ? gateway_request(gport2, SVC, 3, 5, rv) : false;
+  bool stale_rejected = stale_result_rejected(cport2, SVC, B, 2, 2, 9001);
+  if (!recovered) std::fprintf(stderr, "activation_crash: recovery detail=%s target=%llu\n", rdet.c_str(), (unsigned long long)qr3.target);
+  bool survivor_reconciled = ack_withheld && recovered && current_b;
+  std::printf("activation_crash ack_withheld=%s epoch_advanced=%s revalidation=%s incomplete=%s old_epoch_rejected=%s no_premature_authority=%s recovered=%s current_b=%s routed_ok=%s stale_rejected=%s survivor_reconciled=%s\n",
+    ack_withheld?"OK":"FAIL", epoch_advanced?"OK":"FAIL", revalidation?"OK":"FAIL", incomplete?"OK":"FAIL",
+    old_epoch_rejected?"OK":"FAIL", no_premature_authority?"OK":"FAIL", recovered?"OK":"FAIL", current_b?"OK":"FAIL",
+    routed_ok?"OK":"FAIL", stale_rejected?"OK":"FAIL", survivor_reconciled?"OK":"FAIL");
+  bool ok = ack_withheld && epoch_advanced && revalidation && incomplete && old_epoch_rejected && no_premature_authority && recovered && current_b && routed_ok && stale_rejected && survivor_reconciled;
+  std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
+  kill_proc(coord2); kill_proc(g2); kill_proc(wb); kill_proc(wa);
+  std::remove(marker);
+  return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
   std::string dir = argc > 1 ? argv[1] : ".";
   bool use_cuda = false; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--cuda") use_cuda = true;
   const char* worker_exe = use_cuda ? "ff_cuda_worker.exe" : "ff_worker.exe";
-  if (argc >= 3) { if (std::string(argv[2]) == "live-fence") return run_live_fence(dir, worker_exe); if (std::string(argv[2]) == "ambiguity") return run_ambiguity(dir, worker_exe); if (std::string(argv[2]) == "gateway") return run_gateway_restart(dir, worker_exe); if (std::string(argv[2]) == "failback") return run_failback(dir, worker_exe); if (std::string(argv[2]) == "cutover") return run_cutover_restart(dir, worker_exe); if (std::string(argv[2]) == "stateful") return run_stateful(dir, worker_exe); }
+  if (argc >= 3) { if (std::string(argv[2]) == "live-fence") return run_live_fence(dir, worker_exe); if (std::string(argv[2]) == "ambiguity") return run_ambiguity(dir, worker_exe); if (std::string(argv[2]) == "gateway") return run_gateway_restart(dir, worker_exe); if (std::string(argv[2]) == "failback") return run_failback(dir, worker_exe); if (std::string(argv[2]) == "cutover") return run_cutover_restart(dir, worker_exe); if (std::string(argv[2]) == "stateful") return run_stateful(dir, worker_exe); if (std::string(argv[2]) == "activation-crash") return run_activation_crash(dir, worker_exe); }
   auto exe = [&](const char* n) { return dir + "\\" + n; };
   const std::uint64_t SVC = 1, A = 10, B = 11;
 
