@@ -282,6 +282,7 @@ FF_TEST(failback_refusal_and_budget) {
   ServiceDefinition svc = svc_ref(sid);
   svc.failback = FailbackPolicy::RETURN_AFTER_VALIDATION;
   svc.anti_flapping.cooldown_ms = 100;
+  svc.anti_flapping.hysteresis_ms = 0;   // this test targets cooldown + readiness, not hysteresis
   svc.anti_flapping.max_auto_attempts = 1;
   fab.create_service(svc);
   ServiceSlotKey slot{sid, ServiceSlotId(1)};
@@ -417,6 +418,95 @@ FF_TEST(stateful_recovery_policy) {
   auto cand = sr.selected;
   FF_CHECK(cand->state.committed_sequence == 100u);
   FF_CHECK_EQ(cand->costs.state_loss_sequences, 0u);
+}
+
+FF_TEST(failback_hysteresis_window) {
+  // Hysteresis: after the cooldown passes, a failback still requires the recovered preferred
+  // target to be CONTINUOUSLY fresh+ready for the hysteresis stability window, so authority
+  // cannot flap around the eligibility threshold.
+  ManualClock& clk = ManualClock::instance();
+  clk.reset();
+  FailoverFabric fab;
+  fab.set_clock(std::shared_ptr<Clock>(&clk, [](Clock*){}));
+  ServiceId sid(13);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.failback = FailbackPolicy::RETURN_AFTER_VALIDATION;
+  svc.anti_flapping.cooldown_ms = 10;
+  svc.anti_flapping.hysteresis_ms = 100;
+  svc.anti_flapping.max_auto_attempts = 2;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(70); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(70); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  reg(fab, TargetId(70), WorkerBootId(70));
+  reg(fab, TargetId(71), WorkerBootId(71));
+  publish_death(fab, TargetId(70), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("pipe-71");
+  fab.execute_plan(*plan, ops);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(71));
+  // Preferred recovers at clk = +5ms.
+  clk.advance(std::chrono::milliseconds(5));
+  fab.register_target(TargetId(70), "pipe-70");
+  fab.publish_candidate_facts(facts(TargetId(70), WorkerBootId(88), true));
+  fab.publish_candidate_state(TargetId(70), CandidateState{});
+  fab.publish_candidate_resources(TargetId(70), cpu_ok());
+  // Cooldown passes (elapsed >= 10) but hysteresis is NOT met (ready since +5ms, now +15ms).
+  clk.advance(std::chrono::milliseconds(10));   // now +15ms
+  auto d1 = fab.evaluate_failback(slot);
+  FF_CHECK(!d1.authorized);
+  FF_CHECK(d1.hysteresis_not_met);
+  // Advance past the hysteresis window (>= 100ms since ready) -> authorized.
+  clk.advance(std::chrono::milliseconds(100));  // now +115ms
+  auto d2 = fab.evaluate_failback(slot);
+  FF_CHECK(d2.authorized);
+}
+
+FF_TEST(failback_attempt_budget) {
+  // Attempt-budget exhaustion: a failback attempt that FAILS consumes the budget; the next
+  // failback is refused with attempts_exhausted and requires operator intervention.
+  ManualClock& clk = ManualClock::instance();
+  clk.reset();
+  FailoverFabric fab;
+  fab.set_clock(std::shared_ptr<Clock>(&clk, [](Clock*){}));
+  ServiceId sid(14);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.failback = FailbackPolicy::MANUAL;
+  svc.anti_flapping.cooldown_ms = 0;
+  svc.anti_flapping.hysteresis_ms = 0;
+  svc.anti_flapping.max_auto_attempts = 1;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(80); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(80); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  reg(fab, TargetId(80), WorkerBootId(80));
+  reg(fab, TargetId(81), WorkerBootId(81));
+  publish_death(fab, TargetId(80), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("pipe-81");
+  fab.execute_plan(*plan, ops);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(81));
+  fab.register_target(TargetId(80), "pipe-80");
+  fab.publish_candidate_facts(facts(TargetId(80), WorkerBootId(99), true));
+  fab.publish_candidate_state(TargetId(80), CandidateState{});
+  fab.publish_candidate_resources(TargetId(80), cpu_ok());
+  fab.authorize_failback(slot);
+  FF_CHECK(fab.evaluate_failback(slot).authorized);
+  // A failed failback attempt (activation refused) consumes the budget.
+  ff_test::InProcessOps fops("pipe-80");
+  fops.force_activation_fail = true;
+  auto fr = fab.execute_failback(slot, fops);
+  FF_CHECK(fr.state != AttemptState::COMPLETED);
+  fab.authorize_failback(slot);
+  auto d = fab.evaluate_failback(slot);
+  FF_CHECK(!d.authorized);
+  FF_CHECK(d.attempts_exhausted);
 }
 
 int main() { return ff_test::run_all(); }

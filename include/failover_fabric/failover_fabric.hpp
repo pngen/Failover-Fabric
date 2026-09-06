@@ -138,7 +138,9 @@ class FailoverFabric {
     bool attempts_exhausted{false};
     bool stale_readiness{false};
     bool policy_refused{false};
+    bool hysteresis_not_met{false};
     std::uint64_t remaining_cooldown_ms{0};
+    std::uint64_t remaining_hysteresis_ms{0};
   };
   FailbackDecision evaluate_failback(ServiceSlotKey slot) const;
   // For FailbackPolicy::MANUAL, explicitly authorize one failback attempt (operator action).
@@ -157,6 +159,10 @@ class FailoverFabric {
   RequestTracker::LateOutcome classify_late_result(RequestId id, const WorkerAuthorization& auth);
   std::size_t ambiguous_count() const noexcept;
   std::size_t rejected_late_count() const noexcept;
+  // Count of authorized dispatches, so a proof can observe that a refused (non-retryable)
+  // replay never resulted in a replacement attempt being dispatched/executed.
+  void record_dispatch() noexcept;
+  std::size_t dispatch_count() const noexcept;
   // A dispatched request whose response was withheld is recorded as OUTCOME_UNKNOWN.
   void mark_outcome_unknown(RequestId request, ServiceSlotKey slot);
   std::optional<RequestRecord> request_state(RequestId id) const;

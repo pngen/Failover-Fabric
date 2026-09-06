@@ -22,7 +22,7 @@ constexpr std::uint8_t role = 1, boot = 2, target = 3, service = 4, slot = 5, se
     idempotent = 44, externally_effectful = 45, txn_incomplete = 46, milestone = 47,
     state_avail = 48, checkpoint_gen = 49, committed_seq = 50, session_ok = 51,
     tenant_ok = 52, model_ok = 53, format_ok = 54, integrity_ok = 55, replay_safe = 56,
-    continuity = 57, min_checkpoint = 58;
+    continuity = 57, min_checkpoint = 58, dispatch_count = 59, hysteresis_ms = 60;
 namespace route {
 constexpr std::uint8_t id = 40, gen = 41, target = 42, tgtgen = 43, inc = 44, boot = 45,
     assign = 46, assigngen = 47, routegen = 48, slot_service = 49, slot_id = 50,

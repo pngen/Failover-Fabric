@@ -132,10 +132,26 @@ std::uint8_t classify_request(std::uint16_t cport, std::uint64_t req_id, bool& f
   return disp;
 }
 
-bool gateway_request(std::uint16_t gport, std::uint64_t service, std::uint64_t a, std::uint64_t b, std::uint64_t& result, std::uint32_t req_id = 5001) {
+// Total authorized dispatches observed by the coordinator (via CLASSIFY_REQUEST).
+std::size_t query_dispatch_count(std::uint16_t cport) {
+  sock c = net::tcp_connect("127.0.0.1", cport);
+  if (c == net::kInvalidSocket) return 0;
+  { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
+  PayloadWriter w; w.u64(ex::fid::request_id, 0);
+  std::size_t dc = 0;
+  if (send1(c, MsgType::CLASSIFY_REQUEST, 7011, 0, w.finish())) {
+    auto r = net::recv_frame(c);
+    if (r && r->type == MsgType::CLASSIFY_REQUEST) { PayloadReader q(r->payload); if (q.has(ex::fid::dispatch_count)) dc = (std::size_t)q.u64(ex::fid::dispatch_count); }
+  }
+  net::close_socket(c);
+  return dc;
+}
+
+bool gateway_request(std::uint16_t gport, std::uint64_t service, std::uint64_t a, std::uint64_t b, std::uint64_t& result, std::uint32_t req_id = 5001, bool idempotent = false, bool externally_effectful = false) {
   sock gw = net::tcp_connect("127.0.0.1", gport);
   if (gw == net::kInvalidSocket) return false;
   PayloadWriter w; w.u64(ex::fid::input_a, a); w.u64(ex::fid::input_b, b); w.u64(ex::fid::service, service); w.u64(ex::fid::slot, 1);
+  w.bool_(ex::fid::idempotent, idempotent); w.bool_(ex::fid::externally_effectful, externally_effectful);
   bool ret = false;
   if (send1(gw, MsgType::VERIFY_SERVICE, req_id, 0, w.finish())) {
     auto r = net::recv_frame(gw);
@@ -252,9 +268,10 @@ static int run_ambiguity(const std::string& dir, const char* worker_exe) {
   { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A); coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
 
   // Dispatch a request that A computes but withholds (EOF). The gateway uses msg id 5001 as
-  // the request id, and the coordinator must record it as an explicit OUTCOME_UNKNOWN.
+  // the request id, marked explicitly NON-RETRYABLE (idempotent=false, externally_effectful=true).
+  // The coordinator must record it as an explicit OUTCOME_UNKNOWN.
   std::uint64_t r = 0;
-  bool reported_success = gateway_request(gport, SVC, 0xBEEFu, 7, r);
+  bool reported_success = gateway_request(gport, SVC, 0xBEEFu, 7, r, 5001, false, true);
   std::string ambig_file = "ambig_" + std::to_string(A) + ".out";
   bool computed = false;
   { FILE* fp = fopen(ambig_file.c_str(), "r"); if (fp) { computed = true; fclose(fp); } }
@@ -284,9 +301,23 @@ static int run_ambiguity(const std::string& dir, const char* worker_exe) {
   bool found2 = false;
   std::uint8_t disp2 = classify_request(cport, 5001, found2);
   bool not_exactly_once = found2 && (disp2 == (std::uint8_t)RequestDisposition::OUTCOME_UNKNOWN);
-  std::printf("ambiguity promoted=%s replayed_verified=%s stale_rejected=%s not_exactly_once=%s\n",
-    promoted?"OK":"FAIL", replayed_verified?"OK":"FAIL", stale_rejected?"OK":"FAIL", not_exactly_once?"OK":"FAIL");
-  bool ok = computed && not_success && outcome_unknown && promoted && replayed_verified && stale_rejected && not_exactly_once;
+  // NON-RETRYABLE REFUSAL: replay the ORIGINAL (id 5001) request through the real path after
+  // failover. It was classified OUTCOME_UNKNOWN and its policy is non-retryable, so the
+  // coordinator must refuse automatic replay (an explicit policy gate), must NOT overwrite the
+  // OUTCOME_UNKNOWN classification, and must NOT authorize/execute any replacement attempt.
+  std::size_t dpre = query_dispatch_count(cport);
+  std::uint64_t r3 = 0;
+  bool replay_refused = !gateway_request(gport, SVC, 7, 11, r3, 5001, false, true);
+  std::size_t dpost = query_dispatch_count(cport);
+  bool no_replay_dispatch = (dpost == dpre);
+  bool found3 = false;
+  std::uint8_t disp3 = classify_request(cport, 5001, found3);
+  bool preserved_unknown = found3 && (disp3 == (std::uint8_t)RequestDisposition::OUTCOME_UNKNOWN);
+  std::printf("ambiguity promoted=%s replayed_verified=%s stale_rejected=%s not_exactly_once=%s replay_refused=%s no_replay_dispatch=%s preserved_unknown=%s\n",
+    promoted?"OK":"FAIL", replayed_verified?"OK":"FAIL", stale_rejected?"OK":"FAIL", not_exactly_once?"OK":"FAIL",
+    replay_refused?"OK":"FAIL", no_replay_dispatch?"OK":"FAIL", preserved_unknown?"OK":"FAIL");
+  bool ok = computed && not_success && outcome_unknown && promoted && replayed_verified && stale_rejected && not_exactly_once
+    && replay_refused && no_replay_dispatch && preserved_unknown;
   std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
   kill_proc(coord); kill_proc(gateway); kill_proc(wa); kill_proc(wb);
   return ok ? 0 : 1;
@@ -372,7 +403,7 @@ static int run_failback(const std::string& dir, const char* worker_exe) {
   // Register with MANUAL failback and a zero cooldown so the proof is deterministic/fast,
   // while still proving that authorization (and not merely health) is required.
   { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A);
-    w.u8(ex::fid::failback, (std::uint8_t)FailbackPolicy::MANUAL); w.u32(ex::fid::cooldown_ms, 0); w.u32(ex::fid::max_auto_attempts, 1);
+    w.u8(ex::fid::failback, (std::uint8_t)FailbackPolicy::MANUAL); w.u32(ex::fid::cooldown_ms, 0); w.u32(ex::fid::max_auto_attempts, 1); w.u32(ex::fid::hysteresis_ms, 0);
     coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
   // Phase 1: A serves.
   std::uint64_t r1 = 0; bool a_served = gateway_request(gport, SVC, 3, 5, r1);

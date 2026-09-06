@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
           if (r.has(ex::fid::failback)) { std::uint8_t fb = r.u8(ex::fid::failback); if (fb <= (std::uint8_t)FailbackPolicy::RETURN_AFTER_VALIDATION) svc.failback = (FailbackPolicy)fb; }
           if (r.has(ex::fid::cooldown_ms)) svc.anti_flapping.cooldown_ms = r.u32(ex::fid::cooldown_ms);
           if (r.has(ex::fid::max_auto_attempts)) svc.anti_flapping.max_auto_attempts = r.u32(ex::fid::max_auto_attempts);
+          if (r.has(ex::fid::hysteresis_ms)) svc.anti_flapping.hysteresis_ms = r.u32(ex::fid::hysteresis_ms);
           try {
             fabric.create_service(svc);
             ServiceSlotKey slot{sid, ServiceSlotId(1)};
@@ -297,9 +298,24 @@ int main(int argc, char** argv) {
           ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
           RequestId req(r.u64(ex::fid::request_id));
           PayloadWriter w;
+          // Explicit idempotency policy (default = non-retryable: non-idempotent, not
+          // replay-safe). The gateway forwards these from the client.
+          bool idempotent = r.has(ex::fid::idempotent) && r.bool_(ex::fid::idempotent);
+          bool externally_effectful = r.has(ex::fid::externally_effectful) && r.bool_(ex::fid::externally_effectful);
           auto cur = fabric.current_assignment(slot);
           if (!cur || cur->state != AssignmentState::ACTIVE) { w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"no current active assignment"); }
           else {
+            // Non-retryable automatic-replay refusal: a request already classified as
+            // OUTCOME_UNKNOWN whose policy forbids replay may NOT be re-dispatched. The
+            // original record is preserved (not overwritten) and no replacement attempt is
+            // authorized — an explicit policy gate, not merely an absent response.
+            if (auto st = fabric.request_state(req)) {
+              if (st->disposition == RequestDisposition::OUTCOME_UNKNOWN && !fabric.retry_allowed(req)) {
+                w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"non-retryable request; automatic replay refused");
+                p->conn->send(MsgType::AUTHORIZE_REQUEST, f.msg_id, f.epoch, w.finish());
+                return;
+              }
+            }
             w.bool_(ex::fid::ok, true);
             auto ep = fabric.current_epoch();
             w.u64(ex::fid::epoch, ep.value()); w.u64(ex::fid::epoch_id, ep.id().value()); w.u64(ex::fid::epoch_boot, ep.boot().value());
@@ -313,8 +329,10 @@ int main(int argc, char** argv) {
             auth.operation = "serve"; auth.worker_boot = cur->worker_boot;
             RequestRecord rec; rec.request = req; rec.execution = ExecutionId(req.value());
             rec.execution_generation = ExecutionGeneration::first(); rec.slot = slot;
-            rec.disposition = RequestDisposition::DISPATCHED; rec.idempotent = false; rec.authority = IdempotencyAuthority::NONE;
-            rec.externally_effectful = false; rec.dispatched_auth = auth; fabric.record_request(rec);
+            rec.disposition = RequestDisposition::DISPATCHED; rec.idempotent = idempotent;
+            rec.authority = idempotent ? IdempotencyAuthority::DETERMINISTIC_REFERENCE : IdempotencyAuthority::NONE;
+            rec.externally_effectful = externally_effectful; rec.dispatched_auth = auth; fabric.record_request(rec);
+            fabric.record_dispatch();
           }
           p->conn->send(MsgType::AUTHORIZE_REQUEST, f.msg_id, f.epoch, w.finish());
         }
@@ -351,6 +369,7 @@ int main(int argc, char** argv) {
         else if (f.type == MsgType::CLASSIFY_REQUEST) {
           PayloadReader r(f.payload); RequestId req(r.u64(ex::fid::request_id));
           PayloadWriter w;
+          w.u64(ex::fid::dispatch_count, fabric.dispatch_count());
           if (auto st = fabric.request_state(req)) {
             w.bool_(ex::fid::ok,true); w.u8(ex::fid::state, (std::uint8_t)st->disposition);
             w.str(ex::fid::detail, to_string(st->disposition));

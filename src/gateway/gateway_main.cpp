@@ -55,10 +55,14 @@ void handle_client(sock c) {
   auto f = net::recv_frame(c);
   if (!f) { net::close_socket(c); return; }
   std::uint64_t a = 0, b = 0; std::uint64_t slot = 1, service = 1;
+  bool idempotent = false, externally_effectful = false;
   { PayloadReader r(f->payload); if (r.has(ex::fid::input_a)) a = r.u64(ex::fid::input_a); if (r.has(ex::fid::input_b)) b = r.u64(ex::fid::input_b);
-    if (r.has(ex::fid::slot)) slot = r.u64(ex::fid::slot); if (r.has(ex::fid::service)) service = r.u64(ex::fid::service); }
+    if (r.has(ex::fid::slot)) slot = r.u64(ex::fid::slot); if (r.has(ex::fid::service)) service = r.u64(ex::fid::service);
+    if (r.has(ex::fid::idempotent)) idempotent = r.bool_(ex::fid::idempotent);
+    if (r.has(ex::fid::externally_effectful)) externally_effectful = r.bool_(ex::fid::externally_effectful); }
   // Authorize dispatch with the coordinator.
   PayloadWriter ar; ar.u64(ex::fid::service, service); ar.u64(ex::fid::slot, slot); ar.u64(ex::fid::request_id, f->msg_id);
+  ar.bool_(ex::fid::idempotent, idempotent); ar.bool_(ex::fid::externally_effectful, externally_effectful);
   PayloadWriter resp; resp.str(ex::fid::detail, "unknown");
   std::uint64_t epoch=0, ep_id=0, ep_boot=0, asg=0, asggen=0, rgen=0, boot=0, inc=0;
   bool auth_ok = false;

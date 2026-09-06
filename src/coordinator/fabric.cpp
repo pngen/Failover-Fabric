@@ -2,6 +2,7 @@
 #include "failover_fabric/failover_fabric.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -81,6 +82,8 @@ struct FailoverFabric::Impl {
   std::unordered_map<ServiceSlotKey, Clock::time_point> last_transition;
   std::unordered_map<ServiceSlotKey, std::uint32_t> failback_attempts;
   std::unordered_set<ServiceSlotKey> manual_failback_authorized;
+  std::atomic<std::size_t> dispatch_count_{0};
+  std::unordered_map<TargetId, Clock::time_point> ready_since;   // hysteresis: when a target last became fresh+ready
 
   // Durable cutover checkpoint / barrier for interrupted-cutover recovery. When a checkpoint
   // path is set, execute_plan persists the reached milestone + pending transaction after each
@@ -268,6 +271,9 @@ void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
     if (f.ready && (impl_->confirmed_failed_targets_.count(f.target))) {
       impl_->confirmed_failed_targets_.erase(f.target);
     }
+    // Hysteresis stability window: record when this target last became fresh+ready, so a
+    // failback to it must observe it stably ready for the configured hysteresis duration.
+    if (f.ready) impl_->ready_since[f.target] = impl_->clock->now();
     t->facts = std::move(f);
   }
 }
@@ -694,6 +700,21 @@ FailoverFabric::FailbackDecision FailoverFabric::evaluate_failback(ServiceSlotKe
       d.reason = "failback in cooldown"; return d;
     }
   }
+  // Hysteresis: the recovered preferred target must have been continuously fresh+ready for
+  // the hysteresis stability window, so authority cannot flap around the eligibility
+  // threshold (a target that flickers ready/unready resets the window).
+  if (afp.hysteresis_ms > 0) {
+    auto rs = impl_->ready_since.find(pref);
+    if (rs == impl_->ready_since.end()) {
+      d.hysteresis_not_met = true; d.reason = "preferred target not stably ready (hysteresis)"; return d;
+    }
+    auto h = std::chrono::duration_cast<std::chrono::milliseconds>(impl_->clock->now() - rs->second).count();
+    if (h >= 0 && (std::uint64_t)h < afp.hysteresis_ms) {
+      d.hysteresis_not_met = true;
+      d.remaining_hysteresis_ms = (std::uint64_t)afp.hysteresis_ms - (std::uint64_t)h;
+      d.reason = "failback in hysteresis window"; return d;
+    }
+  }
   auto ait = impl_->failback_attempts.find(slot);
   if (ait != impl_->failback_attempts.end() && ait->second >= afp.max_auto_attempts) {
     d.attempts_exhausted = true; d.reason = "failback attempt budget exhausted"; return d;
@@ -768,6 +789,9 @@ std::optional<RequestRecord> FailoverFabric::request_state(RequestId id) const {
   std::shared_lock lk(impl_->mtx);
   return impl_->requests.find(id);
 }
+void FailoverFabric::record_dispatch() noexcept { impl_->dispatch_count_.fetch_add(1, std::memory_order_relaxed); }
+std::size_t FailoverFabric::dispatch_count() const noexcept { return impl_->dispatch_count_.load(std::memory_order_relaxed); }
+
 bool FailoverFabric::retry_allowed(RequestId id) const {
   std::shared_lock lk(impl_->mtx);
   auto rec = impl_->requests.find(id);
