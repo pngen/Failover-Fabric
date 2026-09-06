@@ -20,14 +20,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(MSVC)
-  add_compile_options(/W4 /permissive-)
+  # Strict warning flags are language-scoped to CXX. Passing /W4 /WX as bare flags to nvcc
+  # (with -forward-unknown-to-host-compiler) triggers an nvcc "single input file required"
+  # parser error, so they must NOT reach the CUDA compiler.
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/permissive-> $<$<COMPILE_LANGUAGE:CXX>:/EHsc> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
   if(FF_FORCE_WARNINGS_AS_ERRORS)
-    add_compile_options(/WX)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
   endif()
-  add_compile_options(/EHsc /utf-8)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
 endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
