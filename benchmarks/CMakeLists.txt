@@ -1,0 +1,2 @@
+add_executable(ff_benchmark benchmark_main.cpp)
+target_link_libraries(ff_benchmark PRIVATE FailoverFabric)
