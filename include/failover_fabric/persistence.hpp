@@ -28,7 +28,7 @@ namespace failover_fabric {
 // The serializable runtime state snapshot. Not a live representation: it is the durable
 // record used to rebuild runtime state after a restorthat must be revalidated before use.
 struct PersistenceSnapshot {
-  std::uint32_t format_version{1};
+  std::uint32_t format_version{2};
   CoordinatorEpoch epoch;
   PolicyGeneration policy_generation;
   ServiceAuthorityGeneration last_authority_gen;
@@ -39,6 +39,15 @@ struct PersistenceSnapshot {
   std::vector<FailureEvent> evidence;
   std::vector<RouteEntry> routes;
   std::vector<WorkerBootId> fenced_boots;
+  // Durable record of an in-progress cutover transaction, so a coordinator restart can
+  // distinguish an interrupted cutover from an already-completed one. When has_txn is false
+  // the txn fields are meaningless (a completed transaction commits its assignment and route
+  // into the normal fields and clears has_txn).
+  bool has_txn{false};
+  Milestone txn_milestone{Milestone::VERIFICATION_COMPLETE};
+  std::optional<Assignment> pending_assignment;   // the AUTHORIZED replacement, not yet committed
+  std::optional<Assignment> source_assignment;    // the assignment being replaced (old active)
+  std::optional<RouteEntry> pending_route;        // route being installed before verification
 };
 
 namespace persistence {

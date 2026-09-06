@@ -42,6 +42,9 @@ class RouteTable {
  public:
   // Install a route only if it is strictly newer than the current one for its slot.
   bool install(RouteEntry entry);
+  // Bind the current route for a slot to a gateway boot (the gateway that now holds it),
+  // without advancing the generation. A re-registered gateway re-acquires route authority.
+  bool bind_gateway(ServiceSlotKey slot, GatewayBootId boot);
   // Acknowledge the current installed route for a slot from a specific gateway boot.
   bool acknowledge(ServiceSlotKey slot, RouteGeneration gen, GatewayBootId boot);
 

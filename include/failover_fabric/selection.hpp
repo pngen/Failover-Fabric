@@ -25,6 +25,7 @@ struct SelectionContext {
   std::vector<WorkerBootId> fenced_boots;            // boots whose authority is revoked
   std::vector<FailureDomainId> failed_domains;       // domains excluded by failure evidence
   std::optional<RouteGeneration> current_route_gen;  // for stale-route precondition
+  std::optional<TargetId> preferred_target;          // failback: recover to this (healthy) target
   bool requires_fresh_readiness{true};
   std::uint64_t now_receipt_seq{0};                   // freshness baseline
 };

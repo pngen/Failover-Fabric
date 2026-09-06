@@ -25,6 +25,15 @@ std::optional<RequestRecord> RequestTracker::find(RequestId id) const {
   return it->rec;
 }
 
+void RequestTracker::set_outcome_unknown(RequestId id) {
+  auto it = find_(id);
+  if (it == records_.end()) { ++ambiguous_; return; }
+  if (it->rec.disposition != RequestDisposition::OUTCOME_UNKNOWN) {
+    it->rec.disposition = RequestDisposition::OUTCOME_UNKNOWN;
+    ++ambiguous_;
+  }
+}
+
 RequestTracker::LateOutcome RequestTracker::classify_late_result(RequestId id, const WorkerAuthorization&) {
   auto it = find_(id);
   if (it == records_.end()) { ++ambiguous_; return LateOutcome::CLASSIFIED_AMBIGUOUS; }

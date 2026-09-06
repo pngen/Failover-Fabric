@@ -74,6 +74,30 @@ struct FailoverFabric::Impl {
   std::unordered_set<TargetId> confirmed_failed_targets_;
   std::uint64_t receipt_seq_{0};
 
+  // Failback / anti-flapping bookkeeping. The preferred target is the service's target of
+  // record (its original home); failback returns authority to it only under policy + a fresh
+  // readiness gate and never automatically. Cooldown + a bounded attempt budget govern flapping.
+  std::unordered_map<ServiceSlotKey, TargetId> preferred;
+  std::unordered_map<ServiceSlotKey, Clock::time_point> last_transition;
+  std::unordered_map<ServiceSlotKey, std::uint32_t> failback_attempts;
+  std::unordered_set<ServiceSlotKey> manual_failback_authorized;
+
+  // Durable cutover checkpoint / barrier for interrupted-cutover recovery. When a checkpoint
+  // path is set, execute_plan persists the reached milestone + pending transaction after each
+  // milestone; when a barrier milestone is set, execute_plan stops at that milestone so the
+  // coordinator can be terminated and restarted to exercise reconciliation.
+  std::string checkpoint_path;
+  Milestone barrier_milestone{Milestone::VERIFICATION_COMPLETE};
+  bool has_txn{false};
+  Milestone txn_milestone{Milestone::INTENT_ONLY};
+  std::optional<Assignment> pending_assignment;
+  std::optional<Assignment> source_assignment;
+  std::optional<RouteEntry> pending_route;
+
+  static std::uint64_t ms_since_epoch(Clock& clk) {
+    return (std::uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(clk.now().time_since_epoch()).count();
+  }
+
   explicit Impl(RuntimeConfig c) : cfg(std::move(c)), clock(std::make_shared<SteadyClock>()),
       last_authority_gen(ServiceAuthorityGeneration::first()) {}
   explicit Impl() : Impl(RuntimeConfig{}) {}
@@ -188,6 +212,9 @@ void FailoverFabric::set_initial_assignment(Assignment a) {
   a.state = AssignmentState::ACTIVE;
   a.provisory = false;
   if (a.authority_generation.is_null()) a.authority_generation = impl_->last_authority_gen;
+  impl_->preferred[a.slot] = a.target;   // target of record / failback home
+  impl_->last_transition[a.slot] = impl_->clock->now();
+  impl_->failback_attempts[a.slot] = 0;
   st->current = std::move(a);
 }
 
@@ -232,6 +259,14 @@ void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
     if (f.service != ServiceId::null()) {
       bool same_svc = t->facts && (*t->facts).service == f.service;
       if (!same_svc) impl_->targets_by_service[f.service].push_back((std::size_t)(t - impl_->targets.data()));
+    }
+    // A fresh, ready incarnation is recovery evidence for the target: a brand-new worker
+    // boot publishing current health means the target recovered, so it must no longer be
+    // treated as a confirmed-failed target (otherwise a recovered/preferred target could
+    // never be a failback candidate). This does not clear an older healthy observation
+    // over a NEWER confirmed failure of the SAME incarnation.
+    if (f.ready && (impl_->confirmed_failed_targets_.count(f.target))) {
+      impl_->confirmed_failed_targets_.erase(f.target);
     }
     t->facts = std::move(f);
   }
@@ -382,11 +417,16 @@ std::vector<Candidate> FailoverFabric::eligible_candidates(ServiceSlotKey slot) 
 // Planning (does NOT mutate authoritative assignment)
 // --------------------------------------------------------------------------- //
 std::optional<FailoverPlan> FailoverFabric::plan_failover(ServiceSlotKey slot) {
+  return plan_failover_pref(slot, std::nullopt);
+}
+
+std::optional<FailoverPlan> FailoverFabric::plan_failover_pref(ServiceSlotKey slot, std::optional<TargetId> preferred) const {
   std::shared_lock lk(impl_->mtx);
   const ServiceDefinition* svc = impl_->service_for_slot(slot);
   if (!svc) return std::nullopt;
   CandidateSnapshot snap = impl_->snapshot_locked(slot);
   SelectionContext ctx = impl_->build_context(slot);
+  ctx.preferred_target = preferred;
   SelectionResult sr = SelectionEngine().select(snap, *svc, impl_->domains, ctx);
   if (!sr.has_selection || !sr.selected) return std::nullopt;
   FailoverPlan plan;
@@ -419,6 +459,22 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
   Candidate selected;
   bool valid = false;
   std::string invalid_reason;
+  // Durable cutover checkpoint: record the reached milestone + pending transaction, save a
+  // checkpoint if one is configured, and report whether the configured barrier was reached so
+  // the caller/coordinator can terminate and restart to exercise interrupted-cutover recovery.
+  auto checkpoint = [&](Milestone m, const std::optional<Assignment>& pend,
+                        const std::optional<Assignment>& src, const std::optional<RouteEntry>& rt) {
+    {
+      std::unique_lock lk2(impl_->mtx);
+      impl_->has_txn = true;
+      impl_->txn_milestone = m;
+      impl_->pending_assignment = pend;
+      impl_->source_assignment = src;
+      impl_->pending_route = rt;
+    }
+    if (!impl_->checkpoint_path.empty()) save(impl_->checkpoint_path);
+    return impl_->barrier_milestone == m;
+  };
   {
     std::unique_lock lk(impl_->mtx);
     result.attempt = impl_->attempt_counter.next();
@@ -479,6 +535,11 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
     impl_->attempt_states.push_back(AttemptState::EVALUATING);
     result.reached = Milestone::INTENT_ONLY;
   }
+  if (checkpoint(Milestone::INTENT_ONLY, new_assign, old_assign, std::nullopt)) {
+    result.state = AttemptState::RECOVERY_REQUIRED;
+    result.detail = "cutover interrupted at INTENT_ONLY (checkpointed)";
+    return result;
+  }
 
   const auto t0 = impl_->clock->now();
 
@@ -494,6 +555,11 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
     result.reached = Milestone::OLD_ADMISSION_FENCED;
     result.state = AttemptState::FENCING;
   }
+  if (checkpoint(Milestone::OLD_ADMISSION_FENCED, new_assign, old_assign, std::nullopt)) {
+    result.state = AttemptState::RECOVERY_REQUIRED;
+    result.detail = "cutover interrupted at OLD_ADMISSION_FENCED (checkpointed)";
+    return result;
+  }
 
   // ---- Authorize + activate replacement ----
   WorkerAuthorization auth = make_auth(impl_->epoch, new_assign, selected, RequestId(1), ExecutionId(1), "serve");
@@ -505,6 +571,11 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
     result.state = AttemptState::PROMOTING;
     result.reached = Milestone::ACTIVATION_ACKNOWLEDGED;
     result.state = AttemptState::CUTTING_OVER;
+  }
+  if (checkpoint(Milestone::ACTIVATION_ACKNOWLEDGED, new_assign, old_assign, std::nullopt)) {
+    result.state = AttemptState::RECOVERY_REQUIRED;
+    result.detail = "cutover interrupted at ACTIVATION_ACKNOWLEDGED (checkpointed)";
+    return result;
   }
 
   // ---- Install route ----
@@ -529,6 +600,11 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
     impl_->routes.install(re);
     result.reached = Milestone::ROUTE_INSTALLED;
     result.state = AttemptState::VERIFYING;
+  }
+  if (checkpoint(Milestone::ROUTE_INSTALLED, new_assign, old_assign, re)) {
+    result.state = AttemptState::RECOVERY_REQUIRED;
+    result.detail = "cutover interrupted at ROUTE_INSTALLED (checkpointed)";
+    return result;
   }
 
   // ---- Verify through the route ----
@@ -555,6 +631,8 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
     new_assign.provisory = false;
     st->current = new_assign;
     impl_->last_authority_gen = new_assign.authority_generation;
+    impl_->last_transition[slot] = impl_->clock->now();
+    impl_->has_txn = false;   // transaction committed; the snapshot records no incomplete cutover
     result.reached = Milestone::VERIFICATION_COMPLETE;
     result.state = AttemptState::COMPLETED;
     result.recovery_verified = true;
@@ -566,6 +644,111 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
   return result;
 }
 // --------------------------------------------------------------------------- //
+// Failback / anti-flapping
+// --------------------------------------------------------------------------- //
+bool FailoverFabric::set_clock(std::shared_ptr<Clock> clock) {
+  std::unique_lock lk(impl_->mtx);
+  if (!clock) return false;
+  impl_->clock = std::move(clock);
+  return true;
+}
+
+FailoverFabric::FailbackDecision FailoverFabric::evaluate_failback(ServiceSlotKey slot) const {
+  std::shared_lock lk(impl_->mtx);
+  FailbackDecision d;
+  const ServiceDefinition* svc = impl_->service_for_slot(slot);
+  if (!svc) { d.reason = "service not found"; return d; }
+  const Impl::SlotState* st = impl_->find_slot(slot);
+  if (!st || !st->current) { d.reason = "no current assignment"; return d; }
+  auto pit = impl_->preferred.find(slot);
+  if (pit == impl_->preferred.end()) { d.reason = "no preferred target"; return d; }
+  const TargetId pref = pit->second;
+  if (st->current->target == pref) { d.reason = "already on preferred target"; return d; }
+  // Failback policy gate: manual requires explicit operator authorization, stay-on-current
+  // never, return-after-validation may proceed subject to the readiness gate below.
+  switch (svc->failback) {
+    case FailbackPolicy::STAY_ON_CURRENT:
+      d.policy_refused = true; d.reason = "failback policy stays on current"; return d;
+    case FailbackPolicy::MANUAL:
+      if (!impl_->manual_failback_authorized.count(slot)) {
+        d.policy_refused = true; d.reason = "manual failback authorization required"; return d;
+      }
+      break;
+    case FailbackPolicy::RETURN_AFTER_VALIDATION:
+      break;
+  }
+  // Fresh-readiness gate for the recovered preferred target (a stale/unready recovered target
+  // is never silently reclaimed without validation).
+  const Impl::TargetRecord* tr = impl_->find_target(pref);
+  if (!tr || !tr->facts || !tr->facts->ready || !tr->facts->evidence_fresh) {
+    d.stale_readiness = true; d.reason = "preferred target readiness stale or unavailable"; return d;
+  }
+  // Anti-flapping: cooldown after the last transition, and a bounded auto-failback attempt
+  // budget, both govern how often authority may bounce back.
+  const AntiFlappingPolicy& afp = svc->anti_flapping;
+  auto lit = impl_->last_transition.find(slot);
+  if (lit != impl_->last_transition.end()) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(impl_->clock->now() - lit->second).count();
+    if (elapsed >= 0 && (std::uint64_t)elapsed < afp.cooldown_ms) {
+      d.in_cooldown = true; d.remaining_cooldown_ms = (std::uint64_t)afp.cooldown_ms - (std::uint64_t)elapsed;
+      d.reason = "failback in cooldown"; return d;
+    }
+  }
+  auto ait = impl_->failback_attempts.find(slot);
+  if (ait != impl_->failback_attempts.end() && ait->second >= afp.max_auto_attempts) {
+    d.attempts_exhausted = true; d.reason = "failback attempt budget exhausted"; return d;
+  }
+  d.authorized = true; d.reason = "failback authorized";
+  return d;
+}
+
+void FailoverFabric::authorize_failback(ServiceSlotKey slot) {
+  std::unique_lock lk(impl_->mtx);
+  impl_->manual_failback_authorized.insert(slot);
+}
+
+AttemptResult FailoverFabric::execute_failback(ServiceSlotKey slot, CutoverOps& ops) {
+  FailbackDecision d = evaluate_failback(slot);
+  if (!d.authorized) {
+    AttemptResult r; r.state = AttemptState::FAILED; r.detail = "failback not authorized: " + d.reason;
+    return r;
+  }
+  std::optional<TargetId> pref;
+  { std::shared_lock lk(impl_->mtx); auto it = impl_->preferred.find(slot); if (it != impl_->preferred.end()) pref = it->second; }
+  if (!pref) { AttemptResult r; r.state = AttemptState::FAILED; r.detail = "no preferred target"; return r; }
+  std::optional<FailoverPlan> plan = plan_failover_pref(slot, pref);
+  if (!plan || !plan->selected) {
+    AttemptResult r; r.state = AttemptState::FAILED; r.detail = "no eligible preferred target for failback"; return r;
+  }
+  AttemptResult ar = execute_plan(*plan, ops);
+  {
+    std::unique_lock lk(impl_->mtx);
+    if (ar.state == AttemptState::COMPLETED) {
+      impl_->last_transition[slot] = impl_->clock->now();
+      impl_->failback_attempts[slot] = 0;   // home reached; reset the failback budget
+    } else {
+      impl_->failback_attempts[slot] += 1;  // an attempt consumed part of the budget
+    }
+  }
+  return ar;
+}
+void FailoverFabric::set_checkpoint_path(const std::string& path) {
+  std::unique_lock lk(impl_->mtx);
+  impl_->checkpoint_path = path;
+}
+void FailoverFabric::set_cutover_barrier(Milestone m) {
+  std::unique_lock lk(impl_->mtx);
+  impl_->barrier_milestone = m;
+}
+void FailoverFabric::clear_cutover_barrier() {
+  std::unique_lock lk(impl_->mtx);
+  impl_->barrier_milestone = Milestone::VERIFICATION_COMPLETE;
+}
+bool FailoverFabric::has_incomplete_cutover() const {
+  std::shared_lock lk(impl_->mtx);
+  return impl_->has_txn && impl_->txn_milestone < Milestone::VERIFICATION_COMPLETE;
+}
+// --------------------------------------------------------------------------- //
 // Requests
 // --------------------------------------------------------------------------- //
 void FailoverFabric::record_request(RequestRecord r) { std::unique_lock lk(impl_->mtx); impl_->requests.record(std::move(r)); }
@@ -575,6 +758,24 @@ RequestTracker::LateOutcome FailoverFabric::classify_late_result(RequestId id, c
 }
 std::size_t FailoverFabric::ambiguous_count() const noexcept { std::shared_lock lk(impl_->mtx); return impl_->requests.ambiguous_count(); }
 std::size_t FailoverFabric::rejected_late_count() const noexcept { std::shared_lock lk(impl_->mtx); return impl_->requests.rejected_late_count(); }
+void FailoverFabric::mark_outcome_unknown(RequestId request, ServiceSlotKey slot) {
+  (void)slot;
+  std::unique_lock lk(impl_->mtx);
+  if (auto rec = impl_->requests.find(request)) { if (rec->disposition != RequestDisposition::OUTCOME_UNKNOWN) rec->disposition = RequestDisposition::OUTCOME_UNKNOWN; }
+  impl_->requests.set_outcome_unknown(request);
+}
+std::optional<RequestRecord> FailoverFabric::request_state(RequestId id) const {
+  std::shared_lock lk(impl_->mtx);
+  return impl_->requests.find(id);
+}
+bool FailoverFabric::retry_allowed(RequestId id) const {
+  std::shared_lock lk(impl_->mtx);
+  auto rec = impl_->requests.find(id);
+  if (!rec) return false;
+  if (rec->authority == IdempotencyAuthority::SAFE_TO_RETRY || rec->authority == IdempotencyAuthority::DETERMINISTIC_REFERENCE) return true;
+  if (rec->externally_effectful) return false;
+  return rec->idempotent;
+}
 
 // --------------------------------------------------------------------------- //
 // Gateway authorization (coordinator validation per dispatch / result commit)
@@ -624,6 +825,10 @@ bool FailoverFabric::install_route(RouteEntry entry, GatewayBootId boot) {
   entry.state = RouteState::ACKNOWLEDGED;
   entry.gateway_boot = boot;
   return impl_->routes.install(std::move(entry));
+}
+bool FailoverFabric::bind_route_gateway(ServiceSlotKey slot, GatewayBootId boot) {
+  std::unique_lock lk(impl_->mtx);
+  return impl_->routes.bind_gateway(slot, boot);
 }
 std::optional<RouteEntry> FailoverFabric::current_route(ServiceSlotKey slot) const {
   std::shared_lock lk(impl_->mtx);
@@ -678,6 +883,11 @@ void FailoverFabric::save(const std::string& path) const {
     snap.evidence = impl_->evidence.all();
     snap.routes = impl_->routes.all_routes();
     snap.fenced_boots = impl_->fenced_boots;
+    snap.has_txn = impl_->has_txn;
+    snap.txn_milestone = impl_->txn_milestone;
+    snap.pending_assignment = impl_->pending_assignment;
+    snap.source_assignment = impl_->source_assignment;
+    snap.pending_route = impl_->pending_route;
   }
   persistence::save_file(path, snap);
 }
@@ -711,6 +921,26 @@ void FailoverFabric::load(const std::string& path) {
   for (RouteEntry& r : snap.routes) impl_->routes.install(std::move(r));
   impl_->routes.mark_revalidation_required();
   for (Impl::TargetRecord& t : impl_->targets) if (t.facts) { t.facts->ready = false; t.facts->evidence_fresh = false; }
+  // Restore the durable interrupted-cutover record.
+  impl_->has_txn = snap.has_txn;
+  impl_->txn_milestone = snap.txn_milestone;
+  impl_->pending_assignment = std::move(snap.pending_assignment);
+  impl_->source_assignment = std::move(snap.source_assignment);
+  impl_->pending_route = std::move(snap.pending_route);
+  // Reconciliation: an interrupted cutover may have fenced the old authority but never
+  // committed the replacement. Authority is never revived by decrementing a generation; the
+  // service is left explicitly revalidation-required / unavailable until a fresh verified
+  // recovery, and at most one exclusive current assignment is maintained (the pending
+  // replacement is never silently promoted to ACTIVE).
+  if (impl_->has_txn && impl_->txn_milestone < Milestone::VERIFICATION_COMPLETE) {
+    for (Impl::SlotState& st : impl_->slots) {
+      if (st.current && st.current->state == AssignmentState::ACTIVE) {
+        if (impl_->boot_fenced(st.current->worker_boot) || impl_->pending_assignment.has_value()) {
+          st.current->state = AssignmentState::REVALIDATION_REQUIRED;
+        }
+      }
+    }
+  }
 }
 
 std::vector<std::string> FailoverFabric::validate_file(const std::string& path) { return persistence::validate_file(path); }

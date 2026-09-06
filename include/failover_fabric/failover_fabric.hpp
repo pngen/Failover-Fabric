@@ -127,6 +127,27 @@ class FailoverFabric {
   std::optional<FailoverPlan> plan_failover(ServiceSlotKey slot);
   AttemptResult execute_plan(const FailoverPlan& plan, CutoverOps& ops);
 
+  // --- failback / anti-flapping ------------------------------------------------ //
+  // Returns whether a failback (return to a recovered/preferred target) is currently
+  // authorized under the service's failback policy and anti-flapping cooldown/attempt budget.
+  bool set_clock(std::shared_ptr<Clock> clock);
+  struct FailbackDecision {
+    bool authorized{false};
+    std::string reason;
+    bool in_cooldown{false};
+    bool attempts_exhausted{false};
+    bool stale_readiness{false};
+    bool policy_refused{false};
+    std::uint64_t remaining_cooldown_ms{0};
+  };
+  FailbackDecision evaluate_failback(ServiceSlotKey slot) const;
+  // For FailbackPolicy::MANUAL, explicitly authorize one failback attempt (operator action).
+  void authorize_failback(ServiceSlotKey slot);
+  // Authorize + execute a failback to the recovered preferred target through the full
+  // authoritative transaction: select -> fence current -> activate -> install route ->
+  // routed verification -> commit. Refuses unless the policy/readiness/anti-flap gate passes.
+  AttemptResult execute_failback(ServiceSlotKey slot, CutoverOps& ops);
+
   // --- gateway authorization (reference correctness) -------------------------- //
   GateDecision authorize_dispatch(const WorkerAuthorization& auth) const;
   GateDecision authorize_result(const WorkerAuthorization& auth) const;
@@ -136,9 +157,17 @@ class FailoverFabric {
   RequestTracker::LateOutcome classify_late_result(RequestId id, const WorkerAuthorization& auth);
   std::size_t ambiguous_count() const noexcept;
   std::size_t rejected_late_count() const noexcept;
+  // A dispatched request whose response was withheld is recorded as OUTCOME_UNKNOWN.
+  void mark_outcome_unknown(RequestId request, ServiceSlotKey slot);
+  std::optional<RequestRecord> request_state(RequestId id) const;
+  // Whether a request may be replayed automatically. A request that is idempotent or whose
+  // idempotency authority explicitly permits retry (including the deterministic reference)
+  // may; a non-idempotent / externally effectful request is refused.
+  bool retry_allowed(RequestId id) const;
 
   // --- routes ------------------------------------------------------------------ //
   bool install_route(RouteEntry entry, GatewayBootId boot);
+  bool bind_route_gateway(ServiceSlotKey slot, GatewayBootId boot);
   std::optional<RouteEntry> current_route(ServiceSlotKey slot) const;
   std::vector<RouteEntry> route_history(ServiceSlotKey slot, std::size_t max) const;
   void mark_routes_revalidation();
@@ -153,9 +182,20 @@ class FailoverFabric {
   void load(const std::string& path);   // throws std::runtime_error on corruption
   static std::vector<std::string> validate_file(const std::string& path);
 
+  // --- interrupted-cutover checkpoint / barrier ------------------------------------ //
+  // When a checkpoint path is set, execute_plan durably persists the reached milestone and
+  // the pending transaction at each cutover milestone. A barrier milestone makes execute_plan
+  // stop (and checkpoint) at that milestone so the coordinator can be terminated and restarted
+  // to exercise interrupted-cutover reconciliation.
+  void set_checkpoint_path(const std::string& path);
+  void set_cutover_barrier(Milestone m);
+  void clear_cutover_barrier();
+  bool has_incomplete_cutover() const;
+
  private:
   struct Impl;
   GateDecision dispatch_allowed_locked(const WorkerAuthorization& auth) const;
+  std::optional<FailoverPlan> plan_failover_pref(ServiceSlotKey slot, std::optional<TargetId> preferred) const;
   std::unique_ptr<Impl> impl_;
 };
 

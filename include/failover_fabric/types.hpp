@@ -244,6 +244,7 @@ class ManualClock final : public Clock {
  public:
   time_point now() const noexcept override { return base_ + elapsed_; }
   void advance(duration d) noexcept { elapsed_ += d; }
+  void reset() noexcept { elapsed_ = duration{0}; }
   static ManualClock& instance() {
     static ManualClock c;
     return c;

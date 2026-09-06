@@ -102,12 +102,14 @@ struct SocketOps : CutoverOps {
 
 int main(int argc, char** argv) {
   std::uint16_t port = 0;
-  std::string load_path;
+  std::string load_path, checkpoint_path;
   for (int i = 1; i < argc - 1; ++i) {
     if (std::string(argv[i]) == "--port") port = (std::uint16_t)parse_u64(argv[i + 1]);
     else if (std::string(argv[i]) == "--load") load_path = argv[i + 1];
+    else if (std::string(argv[i]) == "--checkpoint") checkpoint_path = argv[i + 1];
   }
   FailoverFabric fabric(RuntimeConfig{});
+  if (!checkpoint_path.empty()) fabric.set_checkpoint_path(checkpoint_path);
   if (!load_path.empty()) {
     try { fabric.load(load_path); } catch (const std::exception& e) { std::fprintf(stderr, "load failed: %s\n", e.what()); return 2; }
     // Advanced epoch durably on restart; the persisted epoch is never reused as current.
@@ -135,9 +137,14 @@ int main(int argc, char** argv) {
           if (r.has(ex::fid::boot)) p->boot = r.u64(ex::fid::boot);
           if (r.has(ex::fid::req_port)) p->req_port = (std::uint16_t)r.u64(ex::fid::req_port);
           if (p->role == ex::kRoleWorker) { std::lock_guard<std::mutex> lk(g_pmu); g_workers[p->target] = p; }
-          else if (p->role == ex::kRoleGateway) { std::lock_guard<std::mutex> lk(g_pmu); g_gateways[p->boot] = p; fabric.set_gateway_boot(GatewayBootId(p->boot));
+          else if (p->role == ex::kRoleGateway) {
+            { std::lock_guard<std::mutex> lk(g_pmu); g_gateways[p->boot] = p; }
+            fabric.set_gateway_boot(GatewayBootId(p->boot));
             // Push current routes to a (re)registered gateway so it can serve after restart.
-            for (auto sv : fabric.services()) { ServiceSlotKey sl{sv.service, ServiceSlotId(1)}; if (auto rt = fabric.current_route(sl)) { RouteEntry re = *rt; { std::lock_guard<std::mutex> lk2(g_pmu); auto wit = g_workers.find(re.target.value()); if (wit != g_workers.end()) re.transport = "tcp://127.0.0.1:" + std::to_string(wit->second->req_port); } PayloadWriter rw; ex::encode_route_entry(rw, re); p->conn->send(MsgType::INSTALL_ROUTE, 2121, fabric.current_epoch().value(), rw.finish()); } } }
+            // NOTE: the worker lookup below re-acquires g_pmu, so the registration scope above
+            // is closed first — a non-recursive mutex must not be re-entered.
+            for (auto sv : fabric.services()) { ServiceSlotKey sl{sv.service, ServiceSlotId(1)}; if (auto rt = fabric.current_route(sl)) { RouteEntry re = *rt; { std::lock_guard<std::mutex> lk2(g_pmu); auto wit = g_workers.find(re.target.value()); if (wit != g_workers.end()) re.transport = "tcp://127.0.0.1:" + std::to_string(wit->second->req_port); } PayloadWriter rw; ex::encode_route_entry(rw, re); p->conn->send(MsgType::INSTALL_ROUTE, 2121, fabric.current_epoch().value(), rw.finish()); fabric.bind_route_gateway(sl, GatewayBootId(p->boot)); } }
+          }
         }
         else if (f.type == MsgType::PUBLISH_READINESS) {
           PayloadReader r(f.payload);
@@ -152,7 +159,20 @@ int main(int argc, char** argv) {
           cf.replica = ReplicaId(tgt.value()); cf.engine = EngineId(tgt.value()); cf.engine_incarnation = EngineIncarnationId(tgt.value());
           cf.worker = WorkerId(tgt.value()); cf.worker_boot = b; cf.profile = ReadinessProfileId(1);
           cf.model_key = model; cf.runtime_abi = abi; cf.ready = ready; cf.activation_eligible = ready; cf.evidence_fresh = true;
-          fabric.publish_candidate_facts(cf); fabric.publish_candidate_state(tgt, CandidateState{});
+          fabric.publish_candidate_facts(cf);
+          {
+            CandidateState cs;
+            cs.state_available = r.has(ex::fid::state_avail) && r.bool_(ex::fid::state_avail);
+            if (r.has(ex::fid::checkpoint_gen)) cs.checkpoint_generation = CheckpointGeneration(r.u64(ex::fid::checkpoint_gen));
+            if (r.has(ex::fid::committed_seq)) cs.committed_sequence = r.u64(ex::fid::committed_seq);
+            cs.correct_session = r.has(ex::fid::session_ok) && r.bool_(ex::fid::session_ok);
+            cs.correct_tenant = r.has(ex::fid::tenant_ok) && r.bool_(ex::fid::tenant_ok);
+            cs.correct_model_generation = r.has(ex::fid::model_ok) && r.bool_(ex::fid::model_ok);
+            cs.state_format_ok = r.has(ex::fid::format_ok) && r.bool_(ex::fid::format_ok);
+            cs.status_integrity_ok = r.has(ex::fid::integrity_ok) && r.bool_(ex::fid::integrity_ok);
+            cs.replay_safe = r.has(ex::fid::replay_safe) && r.bool_(ex::fid::replay_safe);
+            fabric.publish_candidate_state(tgt, cs);
+          }
           fabric.publish_candidate_resources(tgt, { CandidateResource{"cpu", cap, CapacityGeneration::first(), {}, false, std::nullopt, ReservationGeneration::null(), false, (std::uint64_t)cap} });
         }
         else if (f.type == MsgType::REGISTER) {
@@ -163,8 +183,16 @@ int main(int argc, char** argv) {
           svc.compatibility.model_key = "ref-det-sequence-v1"; svc.compatibility.runtime_abi = "ff-ref-v1";
           svc.domain_requirement.require_domain_independence = false;
           svc.resources.push_back(ResourceRequirement{"cpu", 1.0, true});
-          svc.recovery.rto_ms = 10000; svc.recovery.continuity = ContinuityClass::REPLAY_SAFE_REQUESTS;
-          svc.recovery.requires_verified_recovery = true; svc.failback = FailbackPolicy::MANUAL; svc.policy_generation = PolicyGeneration::first();
+          svc.recovery.rto_ms = 10000; svc.recovery.requires_verified_recovery = true; svc.policy_generation = PolicyGeneration::first();
+          // Optional continuity / recovery-point parameters (defaults preserved when absent).
+          svc.recovery.continuity = ContinuityClass::REPLAY_SAFE_REQUESTS;
+          if (r.has(ex::fid::continuity)) { std::uint8_t cc = r.u8(ex::fid::continuity); if (cc <= (std::uint8_t)ContinuityClass::UNKNOWN) svc.recovery.continuity = (ContinuityClass)cc; }
+          if (r.has(ex::fid::min_checkpoint)) svc.recovery.min_checkpoint_gen = CheckpointGeneration(r.u64(ex::fid::min_checkpoint));
+          // Optional failback / anti-flapping parameters (defaults preserved when absent).
+          svc.failback = FailbackPolicy::MANUAL;
+          if (r.has(ex::fid::failback)) { std::uint8_t fb = r.u8(ex::fid::failback); if (fb <= (std::uint8_t)FailbackPolicy::RETURN_AFTER_VALIDATION) svc.failback = (FailbackPolicy)fb; }
+          if (r.has(ex::fid::cooldown_ms)) svc.anti_flapping.cooldown_ms = r.u32(ex::fid::cooldown_ms);
+          if (r.has(ex::fid::max_auto_attempts)) svc.anti_flapping.max_auto_attempts = r.u32(ex::fid::max_auto_attempts);
           try {
             fabric.create_service(svc);
             ServiceSlotKey slot{sid, ServiceSlotId(1)};
@@ -197,14 +225,35 @@ int main(int argc, char** argv) {
         else if (f.type == MsgType::EXECUTE_FAILOVER) {
           PayloadReader r(f.payload);
           ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
+          if (r.has(ex::fid::state)) { std::uint8_t bm = r.u8(ex::fid::state); if (bm <= (std::uint8_t)Milestone::VERIFICATION_COMPLETE) fabric.set_cutover_barrier((Milestone)bm); }
           auto plan = fabric.plan_failover(slot);
           if (!plan) { PayloadWriter w; w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"no eligible replacement"); p->conn->send(MsgType::EXECUTE_FAILOVER, f.msg_id, f.epoch, w.finish()); return; }
           SocketOps ops; ops.fab = &fabric;
           AttemptResult ar = fabric.execute_plan(*plan, ops);
+          fabric.clear_cutover_barrier();
           PayloadWriter w; w.bool_(ex::fid::ok, ar.state == AttemptState::COMPLETED && ar.recovery_verified);
           w.u8(ex::fid::state, (std::uint8_t)ar.state); w.str(ex::fid::detail, ar.detail);
           if (auto cur = fabric.current_assignment(slot)) w.u64(ex::fid::target, cur->target.value());
           p->conn->send(MsgType::EXECUTE_FAILOVER, f.msg_id, f.epoch, w.finish());
+        }
+        else if (f.type == MsgType::REQUEST_FAILBACK) {
+          PayloadReader r(f.payload);
+          ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
+          bool authorize = r.has(ex::fid::authorize) && r.bool_(ex::fid::authorize);
+          if (authorize) fabric.authorize_failback(slot);
+          auto d = fabric.evaluate_failback(slot);
+          PayloadWriter w;
+          if (!d.authorized) {
+            w.bool_(ex::fid::ok,false); w.str(ex::fid::detail, d.reason); w.bool_(ex::fid::state, d.in_cooldown);
+            p->conn->send(MsgType::REQUEST_FAILBACK, f.msg_id, f.epoch, w.finish());
+          } else {
+            SocketOps ops; ops.fab = &fabric;
+            AttemptResult ar = fabric.execute_failback(slot, ops);
+            w.bool_(ex::fid::ok, ar.state == AttemptState::COMPLETED && ar.recovery_verified);
+            w.u8(ex::fid::state, (std::uint8_t)ar.state); w.str(ex::fid::detail, ar.detail);
+            if (auto cur = fabric.current_assignment(slot)) w.u64(ex::fid::target, cur->target.value());
+            p->conn->send(MsgType::REQUEST_FAILBACK, f.msg_id, f.epoch, w.finish());
+          }
         }
         else if (f.type == MsgType::PUBLISH_FAILURE) {
           PayloadReader r(f.payload);
@@ -221,7 +270,27 @@ int main(int argc, char** argv) {
           if (auto cur = fabric.current_assignment(slot)) w.u64(ex::fid::target, cur->target.value());
           w.bool_(ex::fid::state, fabric.revalidation_required_count() > 0);
           w.u64(ex::fid::seq, fabric.ambiguous_count());
+          w.bool_(ex::fid::txn_incomplete, fabric.has_incomplete_cutover());
+          w.u64(ex::fid::epoch, fabric.current_epoch().value());
+          // Report the current route generation and the gateway boot it was installed to, so
+          // a (re)connected gateway can confirm it holds the present route authority and a
+          // stale boot/generation cannot be mistaken for current.
+          if (auto rt = fabric.current_route(slot)) { w.u64(ex::fid::route_gen, rt->generation.value()); w.u64(ex::fid::boot, rt->gateway_boot.value()); }
           p->conn->send(MsgType::QUERY_ROUTE, f.msg_id, f.epoch, w.finish());
+        }
+        else if (f.type == MsgType::CHECK_ROUTE_ACK) {
+          // Validate a gateway's route acknowledgment against the live route table: only the
+          // gateway boot that currently holds the route (and the present generation) may
+          // acknowledge it. A stale boot or stale generation is rejected.
+          PayloadReader r(f.payload); ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
+          RouteGeneration gen(r.u64(ex::fid::route_gen)); GatewayBootId gboot(r.u64(ex::fid::boot));
+          PayloadWriter w;
+          auto rt = fabric.current_route(slot);
+          if (!rt) { w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"no current route"); }
+          else if (rt->generation != gen) { w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"stale route generation"); }
+          else if (rt->gateway_boot != gboot) { w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"stale gateway boot"); }
+          else { w.bool_(ex::fid::ok,true); w.str(ex::fid::detail,"route acknowledgment accepted"); }
+          p->conn->send(MsgType::CHECK_ROUTE_ACK, f.msg_id, f.epoch, w.finish());
         }
         else if (f.type == MsgType::AUTHORIZE_REQUEST) {
           PayloadReader r(f.payload);
@@ -260,9 +329,35 @@ int main(int argc, char** argv) {
           auth.worker_boot = WorkerBootId(r.u64(ex::fid::boot));
           auth.incarnation = EngineIncarnationId(r.u64(ex::fid::incarnation));
           auth.request = RequestId(r.u64(ex::fid::request_id)); auth.execution = ExecutionId(r.u64(ex::fid::execution_id));
-          GateDecision d = fabric.authorize_result(auth);
-          PayloadWriter w; w.bool_(ex::fid::ok, d.allowed); if (!d.allowed) w.str(ex::fid::detail, d.reason);
+          bool withheld = r.has(ex::fid::withheld) && r.bool_(ex::fid::withheld);
+          PayloadWriter w;
+          if (withheld) {
+            // The target computed but never returned a result: the final outcome is unknown.
+            // It is never fabricated as success; the request is recorded as OUTCOME_UNKNOWN.
+            if (auto st = fabric.request_state(auth.request)) {
+              if (st->disposition != RequestDisposition::OUTCOME_UNKNOWN) fabric.mark_outcome_unknown(auth.request, slot);
+            } else {
+              RequestRecord rec; rec.request = auth.request; rec.execution = auth.execution;
+              rec.slot = slot; rec.disposition = RequestDisposition::OUTCOME_UNKNOWN;
+              rec.dispatched_auth = auth; fabric.record_request(rec);
+            }
+            w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"response withheld; outcome unknown");
+          } else {
+            GateDecision d = fabric.authorize_result(auth);
+            w.bool_(ex::fid::ok, d.allowed); if (!d.allowed) w.str(ex::fid::detail, d.reason);
+          }
           p->conn->send(MsgType::AUTHORIZE_RESULT, f.msg_id, f.epoch, w.finish());
+        }
+        else if (f.type == MsgType::CLASSIFY_REQUEST) {
+          PayloadReader r(f.payload); RequestId req(r.u64(ex::fid::request_id));
+          PayloadWriter w;
+          if (auto st = fabric.request_state(req)) {
+            w.bool_(ex::fid::ok,true); w.u8(ex::fid::state, (std::uint8_t)st->disposition);
+            w.str(ex::fid::detail, to_string(st->disposition));
+          } else {
+            w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"unknown request");
+          }
+          p->conn->send(MsgType::CLASSIFY_REQUEST, f.msg_id, f.epoch, w.finish());
         }
         else if (f.type == MsgType::SAVE) {
           PayloadReader r(f.payload); std::string path = r.str(ex::fid::detail);

@@ -222,7 +222,7 @@ CoordinatorEpoch dec_epoch(Reader& r){ return CoordinatorEpoch(r.u64(), dec_id<C
 // --------------------------------------------------------------------------- //
 namespace {
 constexpr std::uint8_t kMagic[8] = { 'F','F','R','S','T','0','0','1' };
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
 }
 
 std::vector<std::uint8_t> encode(const PersistenceSnapshot& s) {
@@ -246,6 +246,14 @@ std::vector<std::uint8_t> encode(const PersistenceSnapshot& s) {
   for (const auto& x : s.routes) enc_route(payload, x);
   put_u32(payload, (std::uint32_t)s.fenced_boots.size());
   for (const auto& x : s.fenced_boots) put_id(payload, x);
+  // In-progress cutover transaction record (version 2+).
+  put_bool(payload, s.has_txn);
+  if (s.has_txn) {
+    put_u8(payload, (std::uint8_t)s.txn_milestone);
+    put_opt(payload, s.pending_assignment, [](auto& b, const Assignment& a){ enc_assign(b, a); });
+    put_opt(payload, s.source_assignment, [](auto& b, const Assignment& a){ enc_assign(b, a); });
+    put_opt(payload, s.pending_route, [](auto& b, const RouteEntry& r){ enc_route(b, r); });
+  }
 
   std::vector<std::uint8_t> blob;
   blob.insert(blob.end(), kMagic, kMagic + 8);
@@ -294,6 +302,16 @@ PersistenceSnapshot decode(const std::vector<std::uint8_t>& blob) {
   for (std::uint32_t i = 0; i < nrt; ++i) s.routes.push_back(dec_route(r));
   auto nfb = r.count();
   for (std::uint32_t i = 0; i < nfb; ++i) s.fenced_boots.push_back(dec_id<WorkerBootId>(r));
+  // In-progress cutover transaction record (version 2+).
+  s.has_txn = r.boolean();
+  if (s.has_txn) {
+    std::uint8_t ms = r.u8(); chk_milestone(ms); s.txn_milestone = (Milestone)ms;
+    s.pending_assignment = opt<Assignment>(r, [](Reader& rr){ return dec_assign(rr); });
+    s.source_assignment = opt<Assignment>(r, [](Reader& rr){ return dec_assign(rr); });
+    s.pending_route = opt<RouteEntry>(r, [](Reader& rr){ return dec_route(rr); });
+    if (s.pending_assignment && s.pending_assignment->state != AssignmentState::AUTHORIZED)
+      throw std::runtime_error("pending assignment must be authorized");
+  }
   if (r.i != r.n) throw std::runtime_error("trailing garbage in persistence payload");
 
   // Semantic validation.

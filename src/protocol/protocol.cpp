@@ -31,6 +31,8 @@ const char* to_string(MsgType m) noexcept {
     case MsgType::REVALIDATE: return "REVALIDATE";
     case MsgType::SAVE: return "SAVE";
     case MsgType::SHUTDOWN: return "SHUTDOWN";
+    case MsgType::CHECK_ROUTE_ACK: return "CHECK_ROUTE_ACK";
+    case MsgType::CLASSIFY_REQUEST: return "CLASSIFY_REQUEST";
     case MsgType::ERROR_MSG: return "ERROR";
   }
   return "UNKNOWN";

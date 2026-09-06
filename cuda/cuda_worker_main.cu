@@ -94,13 +94,26 @@ int main(int argc, char** argv) {
       if (f) { PayloadReader r(f->payload); if (r.has(ex::fid::input_a)) a = r.u64(ex::fid::input_a); if (r.has(ex::fid::input_b)) b = r.u64(ex::fid::input_b); if (r.has(ex::fid::boot)) req_boot = r.u64(ex::fid::boot); }
       PayloadWriter w;
       if (active.load() && req_boot == my_boot) {
-        std::uint64_t gpu = cuda_reference(a, b);
-        std::uint64_t cpu = ex::reference_result(a, b);
-        // CPU parity: the GPU result must equal the CPU reference exactly.
-        bool parity = (gpu == cpu);
-        std::string rs = std::to_string(gpu);
-        w.bool_(ex::fid::ok, parity);
-        std::vector<std::uint8_t> rb(rs.begin(), rs.end()); if (!rb.empty()) w.bytes(ex::fid::payload, rb);
+        if (a == 0xDBADu) {
+          // Sever the control connection but keep serving (live old-worker fencing).
+          net::close_socket(ctrl);
+          std::uint64_t gpu = cuda_reference(a, b); (void)gpu;
+          w.bool_(ex::fid::ok, true);
+        } else if (a == 0xBEEFu) {
+          // Computation happens (real GPU kernel); the response is withheld (ambiguity barrier).
+          std::uint64_t gpu = cuda_reference(a & 0xFFFFFFFFFFFFull, b);
+          std::string of = "ambig_" + std::to_string(target) + ".out";
+          FILE* fp = fopen(of.c_str(), "w"); if (fp) { fprintf(fp, "%llu\n", (unsigned long long)gpu); fclose(fp); }
+          net::close_socket(c);  // withhold the response; peer sees EOF
+          return;
+        } else {
+          std::uint64_t gpu = cuda_reference(a, b);
+          std::uint64_t cpu = ex::reference_result(a, b);
+          bool parity = (gpu == cpu);
+          std::string rs = std::to_string(gpu);
+          w.bool_(ex::fid::ok, parity);
+          std::vector<std::uint8_t> rb(rs.begin(), rs.end()); if (!rb.empty()) w.bytes(ex::fid::payload, rb);
+        }
       } else { w.bool_(ex::fid::ok, false); w.str(ex::fid::detail, "not active or stale boot"); }
       ex::send_msg(c, MsgType::EXECUTION_RESULT, f ? f->msg_id : 0, f ? f->epoch : 0, w.finish());
       net::close_socket(c);

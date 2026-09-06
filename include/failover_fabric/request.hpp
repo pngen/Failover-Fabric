@@ -52,6 +52,10 @@ class RequestTracker {
   enum class LateOutcome { ACCEPTED, REJECTED_STALE, CLASSIFIED_AMBIGUOUS };
   LateOutcome classify_late_result(RequestId id, const WorkerAuthorization& result_auth);
 
+  // A dispatched request whose response was withheld by the target has an unknown final
+  // outcome: it is never fabricated as success, and an explicit OUTCOME_UNKNOWN is recorded.
+  void set_outcome_unknown(RequestId id);
+
   std::size_t ambiguous_count() const noexcept { return ambiguous_; }
   std::size_t rejected_late_count() const noexcept { return rejected_late_; }
   std::size_t size() const noexcept { return records_.size(); }

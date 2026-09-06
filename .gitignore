@@ -11,6 +11,14 @@ coord_state.ff
 *.ff.tmp
 scratch_client*
 iso_test.ps1
+coord_cut.ff
+st_a.ff
+ambig_*.out
+*.obj
+
+# Local install / consumer validation trees
+/.install/
+/.consumer/
 
 # Editor / OS
 .vscode/

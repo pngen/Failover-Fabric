@@ -16,7 +16,13 @@ constexpr std::uint8_t role = 1, boot = 2, target = 3, service = 4, slot = 5, se
     source = 14, ok = 15, detail = 16, epoch = 17, route_gen = 18, assignment_gen = 19,
     request_id = 20, execution_id = 21, payload = 22, state = 23, transport = 24,
     operation = 25, incarnation = 26, host = 27, assignment_id = 28, gate_port = 29,
-    req_port = 30, input_a = 31, input_b = 32, epoch_id = 33, epoch_boot = 34;
+    req_port = 30, input_a = 31, input_b = 32, epoch_id = 33, epoch_boot = 34,
+    failback = 35, cooldown_ms = 36, max_auto_attempts = 37, authorize = 38,
+    checkpoint = 39, checkpoint_seq = 40, session = 41, withheld = 42, retry = 43,
+    idempotent = 44, externally_effectful = 45, txn_incomplete = 46, milestone = 47,
+    state_avail = 48, checkpoint_gen = 49, committed_seq = 50, session_ok = 51,
+    tenant_ok = 52, model_ok = 53, format_ok = 54, integrity_ok = 55, replay_safe = 56,
+    continuity = 57, min_checkpoint = 58;
 namespace route {
 constexpr std::uint8_t id = 40, gen = 41, target = 42, tgtgen = 43, inc = 44, boot = 45,
     assign = 46, assigngen = 47, routegen = 48, slot_service = 49, slot_id = 50,

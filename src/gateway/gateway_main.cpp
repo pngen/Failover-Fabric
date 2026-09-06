@@ -32,8 +32,8 @@ std::string worker_transport_for(std::uint64_t slot) {
 }
 
 // Connect to the worker described by the route, send a compute request, read the result.
-std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t b, bool& ok) {
-  ok = false;
+std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t b, bool& ok, bool& withheld) {
+  ok = false; withheld = false;
   std::string host; std::uint16_t port;
   ex::parse_tcp_transport(route.transport, host, port);
   sock ws = net::tcp_connect(host, port);
@@ -44,7 +44,8 @@ std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t 
   std::string result;
   if (sent) {
     auto resp = net::recv_frame(ws);
-    if (resp && resp->type == MsgType::EXECUTION_RESULT) { PayloadReader rr(resp->payload); ok = rr.has(ex::fid::ok) && rr.bool_(ex::fid::ok); if (ok && rr.has(ex::fid::payload)) { auto bv = rr.bytes(ex::fid::payload); result.assign((const char*)bv.data(), bv.size()); } }
+    if (!resp) { withheld = true; }  // EOF: response withheld, in-flight outcome unknown
+    else if (resp->type == MsgType::EXECUTION_RESULT) { PayloadReader rr(resp->payload); ok = rr.has(ex::fid::ok) && rr.bool_(ex::fid::ok); if (ok && rr.has(ex::fid::payload)) { auto bv = rr.bytes(ex::fid::payload); result.assign((const char*)bv.data(), bv.size()); } }
   }
   net::close_socket(ws);
   return result;
@@ -74,22 +75,25 @@ void handle_client(sock c) {
   RouteEntry route; bool have_route = false;
   { std::lock_guard<std::mutex> lk(g_route_mutex); auto it = g_routes.find(slot); if (it != g_routes.end()) { route = it->second; have_route = true; } }
   if (!have_route) { resp.bool_(ex::fid::ok,false); resp.str(ex::fid::detail,"no route installed"); ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish()); net::close_socket(c); return; }
-  bool wok = false;
-  std::string result = compute_on_worker(route, a, b, wok);
-  // Authorize result with the coordinator.
+  bool wok = false; bool withheld = false;
+  std::string result = compute_on_worker(route, a, b, wok, withheld);
+  // Authorize result with the coordinator. A withheld response (worker closed without a
+  // result) is reported as OUTCOME_UNKNOWN rather than fabricated as success.
   PayloadWriter ar2; ar2.u64(ex::fid::service, service); ar2.u64(ex::fid::slot, slot);
   ar2.u64(ex::fid::epoch, epoch); ar2.u64(ex::fid::epoch_id, ep_id); ar2.u64(ex::fid::epoch_boot, ep_boot);
   ar2.u64(ex::fid::assignment_id, asg); ar2.u64(ex::fid::assignment_gen, asggen);
   ar2.u64(ex::fid::route_gen, rgen); ar2.u64(ex::fid::boot, boot); ar2.u64(ex::fid::incarnation, inc);
   ar2.u64(ex::fid::request_id, f->msg_id); ar2.u64(ex::fid::execution_id, f->msg_id);
-  bool res_ok = false;
+  ar2.bool_(ex::fid::withheld, withheld);
+  bool res_ok = false; std::string res_detail;
   { std::lock_guard<std::mutex> lk(g_rpc_mutex);
     if (ex::send_msg(g_rpc, MsgType::AUTHORIZE_RESULT, f->msg_id, g_epoch, ar2.finish())) {
       auto rr = net::recv_frame(g_rpc);
-      if (rr && rr->type == MsgType::AUTHORIZE_RESULT) { PayloadReader q(rr->payload); res_ok = q.has(ex::fid::ok) && q.bool_(ex::fid::ok); } } }
+      if (rr && rr->type == MsgType::AUTHORIZE_RESULT) { PayloadReader q(rr->payload); res_ok = q.has(ex::fid::ok) && q.bool_(ex::fid::ok); if (q.has(ex::fid::detail)) res_detail = q.str(ex::fid::detail); } } }
   bool parity = wok && result == std::to_string(ex::reference_result(a, b));
-  resp.bool_(ex::fid::ok, res_ok && parity);
+  resp.bool_(ex::fid::ok, res_ok && parity && !withheld);
   resp.bool_(ex::fid::state, parity);
+  if (!res_detail.empty()) resp.str(ex::fid::detail, res_detail);
   std::vector<std::uint8_t> rb(result.begin(), result.end());
   if (!rb.empty()) resp.bytes(ex::fid::payload, rb);
   ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish());
@@ -133,8 +137,8 @@ int main(int argc, char** argv) {
         std::uint64_t a = r.u64(ex::fid::input_a), b = r.u64(ex::fid::input_b);
         RouteEntry route; bool have = false; std::uint64_t slot = 1;
         { std::lock_guard<std::mutex> lk(g_route_mutex); auto it = g_routes.begin(); if (it != g_routes.end()) { route = it->second; have = true; slot = it->first; } }
-        bool wok = false; std::string result;
-        if (have) result = compute_on_worker(route, a, b, wok);
+        bool wok = false; bool withheld = false; std::string result;
+        if (have) result = compute_on_worker(route, a, b, wok, withheld);
         bool parity = wok && result == std::to_string(ex::reference_result(a, b));
         PayloadWriter w; w.bool_(ex::fid::ok, parity);
         std::vector<std::uint8_t> rb(result.begin(), result.end()); if (!rb.empty()) w.bytes(ex::fid::payload, rb);

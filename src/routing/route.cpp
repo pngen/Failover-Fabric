@@ -31,6 +31,14 @@ bool RouteTable::install(RouteEntry entry) {
   return true;
 }
 
+bool RouteTable::bind_gateway(ServiceSlotKey slot, GatewayBootId boot) {
+  SlotRoute* sr = find_(slot);
+  if (!sr || sr->current.state == RouteState::EMPTY) return false;
+  if (sr->current.gateway_boot == boot) return true;
+  sr->current.gateway_boot = boot;
+  return true;
+}
+
 bool RouteTable::acknowledge(ServiceSlotKey slot, RouteGeneration gen, GatewayBootId boot) {
   SlotRoute* sr = find_(slot);
   if (!sr) return false;

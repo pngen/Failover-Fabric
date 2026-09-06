@@ -243,8 +243,14 @@ SelectionResult SelectionEngine::select(const CandidateSnapshot& snap, const Ser
     return out;
   }
 
-  // Phase 2: rank eligible candidates deterministically.
+  // Phase 2: rank eligible candidates deterministically. When a failback/preferred target
+  // is specified, it is strongly preferred among hard-eligible candidates — but it must still
+  // pass hard eligibility (fresh readiness, compatibility, state, domains, etc.). A stale or
+  // unready preferred target is never silently selected.
   std::stable_sort(eligible.begin(), eligible.end(), [&](const Candidate* a, const Candidate* b) {
+    const bool pa = ctx.preferred_target && a->facts.target == *ctx.preferred_target;
+    const bool pb = ctx.preferred_target && b->facts.target == *ctx.preferred_target;
+    if (pa != pb) return pa;   // preferred target first (only if both hard-eligible)
     std::uint64_t ra = rank(*a, svc, ctx);
     std::uint64_t rb = rank(*b, svc, ctx);
     if (ra != rb) return ra > rb;

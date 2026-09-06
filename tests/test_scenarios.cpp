@@ -203,4 +203,220 @@ FF_TEST(persistence_roundtrip_and_corruption) {
   std::remove(path.c_str()); std::remove("corrupt.ff");
 }
 
+FF_TEST(failback_policy_and_anti_flapping) {
+  // Deterministic failback/anti-flapping test using the injectable ManualClock.
+  ManualClock& clk = ManualClock::instance();
+  clk.reset();
+  FailoverFabric fab;
+  fab.set_clock(std::shared_ptr<Clock>(&clk, [](Clock*){}));
+  ServiceId sid(9);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.failback = FailbackPolicy::MANUAL;
+  svc.anti_flapping.cooldown_ms = 100;
+  svc.anti_flapping.hysteresis_ms = 50;
+  svc.anti_flapping.max_auto_attempts = 2;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  // A (preferred/home, target 10) active; B (standby, target 11).
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(10); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(10); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);   // records preferred target 10
+  reg(fab, TargetId(10), WorkerBootId(10));
+  reg(fab, TargetId(11), WorkerBootId(11));
+
+  // Fail A (preferred) -> failover to B.
+  publish_death(fab, TargetId(10), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("pipe-11");
+  fab.execute_plan(*plan, ops);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(11));
+
+  // A'' s recovered preferred target (fresh boot) comes back but must NOT reclaim automatically:
+  // before any explicit failback request, the assignment stays on B.
+  fab.register_target(TargetId(10), "pipe-10");
+  fab.publish_candidate_facts(facts(TargetId(10), WorkerBootId(42), true));
+  fab.publish_candidate_state(TargetId(10), CandidateState{});
+  fab.publish_candidate_resources(TargetId(10), cpu_ok());
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(11));   // no automatic reclaim
+  FF_CHECK(!fab.evaluate_failback(slot).authorized);                  // MANUAL requires authorization
+
+  // Explicit operator authorization (MANUAL) still blocked by anti-flapping cooldown.
+  fab.authorize_failback(slot);
+  auto before_cooldown = fab.evaluate_failback(slot);
+  FF_CHECK(!before_cooldown.authorized);
+  FF_CHECK(before_cooldown.in_cooldown);
+
+  // Advance the manual clock past the cooldown window -> authorized.
+  clk.advance(std::chrono::milliseconds(120));
+  auto ready = fab.evaluate_failback(slot);
+  FF_CHECK(ready.authorized);
+
+  // Execute failback through the authoritative transaction: new assignment + route gen.
+  ff_test::InProcessOps fops("pipe-10");
+  auto fr = fab.execute_failback(slot, fops);
+  FF_CHECK_EQ(fr.state, AttemptState::COMPLETED);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(10));
+  FF_CHECK_EQ(fab.current_assignment(slot)->worker_boot, WorkerBootId(42));   // fresh incarnation
+  // The old standby authority (B boot 11) must remain rejected.
+  Assignment cur = *fab.current_assignment(slot);
+  WorkerAuthorization stale;
+  stale.epoch = fab.current_epoch(); stale.slot = slot; stale.assignment = cur.id;
+  stale.assignment_generation = cur.generation; stale.route_generation = cur.route_generation;
+  stale.incarnation = EngineIncarnationId(11); stale.request = RequestId(1); stale.execution = ExecutionId(1);
+  stale.operation = "serve"; stale.worker_boot = WorkerBootId(11);
+  FF_CHECK(!fab.authorize_dispatch(stale).allowed);
+  // New route generation must advance beyond the failover route.
+  auto nrt = fab.current_route(slot);
+  FF_CHECK(nrt.has_value());
+  FF_CHECK(nrt->generation.value() > 2);   // 1 (initial) -> 2 (failover) -> >=3 (failback)
+}
+
+FF_TEST(failback_refusal_and_budget) {
+  ManualClock& clk = ManualClock::instance();
+  clk.reset();
+  FailoverFabric fab;
+  fab.set_clock(std::shared_ptr<Clock>(&clk, [](Clock*){}));
+  ServiceId sid(10);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.failback = FailbackPolicy::RETURN_AFTER_VALIDATION;
+  svc.anti_flapping.cooldown_ms = 100;
+  svc.anti_flapping.max_auto_attempts = 1;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(20); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(20); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  reg(fab, TargetId(20), WorkerBootId(20));
+  reg(fab, TargetId(21), WorkerBootId(21));
+  publish_death(fab, TargetId(20), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("pipe-21");
+  fab.execute_plan(*plan, ops);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(21));
+
+  // Preferred target recovers but is NOT yet validated (unready) for RETURN_AFTER_VALIDATION.
+  fab.register_target(TargetId(20), "pipe-20");
+  fab.publish_candidate_facts(facts(TargetId(20), WorkerBootId(99), /*ready=*/false));
+  fab.publish_candidate_state(TargetId(20), CandidateState{});
+  fab.publish_candidate_resources(TargetId(20), cpu_ok());
+  auto unready = fab.evaluate_failback(slot);
+  FF_CHECK(!unready.authorized);
+  FF_CHECK(unready.stale_readiness);
+
+  // Fresh readiness (validated) but still in cooldown.
+  fab.publish_candidate_facts(facts(TargetId(20), WorkerBootId(99), true));
+  clk.advance(std::chrono::milliseconds(20));   // < cooldown (100ms)
+  FF_CHECK(!fab.evaluate_failback(slot).authorized);
+  clk.advance(std::chrono::milliseconds(120));  // past cooldown
+  FF_CHECK(fab.evaluate_failback(slot).authorized);
+
+  // First failback succeeds (budget reset), authority returns to the preferred target.
+  ff_test::InProcessOps fops("pipe-20");
+  auto fr = fab.execute_failback(slot, fops);
+  FF_CHECK_EQ(fr.state, AttemptState::COMPLETED);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(20));
+
+  // Failback again: policy RETURN_AFTER_VALIDATION + a recovered preferred target is now the
+  // current target, so it cannot bounce back and forth until the budget is consumed.
+  FF_CHECK(!fab.evaluate_failback(slot).authorized);   // already home
+}
+
+FF_TEST(request_ambiguity_replay_policy) {
+  FailoverFabric fab;
+  ServiceId sid(11);
+  setUp_independent(fab, sid, TargetId(50), TargetId(51));
+  ServiceSlotKey slot = key(sid);
+  Assignment cur = *fab.current_assignment(slot);
+  WorkerAuthorization auth;
+  auth.epoch = fab.current_epoch(); auth.slot = slot; auth.assignment = cur.id;
+  auth.assignment_generation = cur.generation; auth.route_generation = cur.route_generation;
+  auth.worker_boot = WorkerBootId(50); auth.request = RequestId(1); auth.execution = ExecutionId(1);
+  auth.operation = "serve";
+
+  // A REPLAY-SAFE request (deterministic reference / idempotent) is dispatched and the target
+  // withholds; it is recorded OUTCOME_UNKNOWN and a retry is authorized by policy.
+  RequestRecord safe; safe.request = RequestId(1); safe.execution = ExecutionId(1);
+  safe.slot = slot; safe.disposition = RequestDisposition::DISPATCHED; safe.idempotent = true;
+  safe.authority = IdempotencyAuthority::DETERMINISTIC_REFERENCE; safe.externally_effectful = false;
+  safe.dispatched_auth = auth;
+  fab.record_request(safe);
+  fab.mark_outcome_unknown(RequestId(1), slot);
+  FF_CHECK(fab.retry_allowed(RequestId(1)));
+  auto st1 = fab.request_state(RequestId(1));
+  FF_CHECK_EQ(st1->disposition, RequestDisposition::OUTCOME_UNKNOWN);
+
+  // A NON-RETRYABLE request (authority NONE, externally effectful) refuses automatic replay.
+  RequestRecord nr; nr.request = RequestId(2); nr.execution = ExecutionId(2);
+  nr.slot = slot; nr.disposition = RequestDisposition::DISPATCHED; nr.idempotent = false;
+  nr.authority = IdempotencyAuthority::NONE; nr.externally_effectful = true;
+  nr.dispatched_auth = auth; nr.client_note = "non-retryable";
+  fab.record_request(nr);
+  fab.mark_outcome_unknown(RequestId(2), slot);
+  FF_CHECK(!fab.retry_allowed(RequestId(2)));
+  FF_CHECK_EQ(fab.request_state(RequestId(2))->disposition, RequestDisposition::OUTCOME_UNKNOWN);
+  FF_CHECK_EQ(fab.ambiguous_count(), 2u);
+  // Never claimed exactly-once: both requests have an UNKNOWN outcome, not RESPONSE_COMMITTED.
+  FF_CHECK(st1->disposition != RequestDisposition::RESPONSE_COMMITTED);
+  FF_CHECK(fab.request_state(RequestId(2))->disposition != RequestDisposition::RESPONSE_COMMITTED);
+}
+
+// A helper that builds a CHECKPOINT_RESTORE candidate whose published state can be tuned,
+// so recovery-point selection can be proven to reject wrong-session / corrupt / old state.
+static void reg_stateful(FailoverFabric& fab, TargetId t, WorkerBootId boot, CandidateState st) {
+  reg(fab, t, boot, true);
+  fab.publish_candidate_state(t, std::move(st));
+}
+
+FF_TEST(stateful_recovery_policy) {
+  FailoverFabric fab;
+  ServiceId sid(12);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.recovery.continuity = ContinuityClass::CHECKPOINT_RESTORE;
+  svc.recovery.min_checkpoint_gen = CheckpointGeneration(5);
+  svc.recovery.requires_verified_recovery = true;
+  svc.domain_requirement.require_domain_independence = false;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(60); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(60); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  CandidateState good;
+  good.state_available = true; good.checkpoint_generation = CheckpointGeneration(5);
+  good.committed_sequence = 100; good.correct_session = true; good.correct_tenant = true;
+  good.correct_model_generation = true; good.state_format_ok = true; good.status_integrity_ok = true; good.replay_safe = true;
+  reg_stateful(fab, TargetId(61), WorkerBootId(61), good);
+  CandidateState wrong_session = good; wrong_session.correct_session = false;
+  reg_stateful(fab, TargetId(62), WorkerBootId(62), wrong_session);
+  CandidateState corrupt = good; corrupt.status_integrity_ok = false;
+  reg_stateful(fab, TargetId(63), WorkerBootId(63), corrupt);
+  CandidateState old = good; old.checkpoint_generation = CheckpointGeneration(4);   // < min 5
+  reg_stateful(fab, TargetId(64), WorkerBootId(64), old);
+  publish_death(fab, TargetId(60), 1);
+
+  // Only the fully-valid candidate is selected; wrong-session / corrupt / too-old are rejected
+  // with the exact blocking reason and never silently downgraded.
+  SelectionResult sr = fab.select(slot);
+  FF_CHECK(sr.has_selection);
+  FF_CHECK_EQ(sr.selected->facts.target, TargetId(61));
+  bool saw_wrong_session = false, saw_corrupt = false, saw_old = false;
+  for (auto& e : sr.exclusions) {
+    if (e.second.first == ExclusionReason::STATE_UNAVAILABLE && e.first == TargetId(62)) saw_wrong_session = true;
+    if (e.second.first == ExclusionReason::STATE_UNAVAILABLE && e.first == TargetId(63)) saw_corrupt = true;
+    if (e.second.first == ExclusionReason::STATE_TOO_OLD && e.first == TargetId(64)) saw_old = true;
+  }
+  FF_CHECK(saw_wrong_session);
+  FF_CHECK(saw_corrupt);
+  FF_CHECK(saw_old);
+  // A fenced stateful candidate (advance beyond the checkpoint) reports loss via committed seq.
+  auto cand = sr.selected;
+  FF_CHECK(cand->state.committed_sequence == 100u);
+  FF_CHECK_EQ(cand->costs.state_loss_sequences, 0u);
+}
+
 int main() { return ff_test::run_all(); }
