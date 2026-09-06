@@ -555,6 +555,13 @@ GateDecision FailoverFabric::dispatch_allowed_locked(const WorkerAuthorization& 
   if (auth.assignment != cur.id || auth.assignment_generation != cur.generation)
     return GateDecision{false, "stale assignment generation", true};
   if (auth.route_generation != cur.route_generation) return GateDecision{false, "stale route generation", true};
+  // Conservative restart: a route that requires revalidation must not authorize dispatch.
+  if (auto rt = impl_->routes.current(auth.slot)) {
+    if (rt->state == RouteState::REVALIDATION_REQUIRED || rt->state == RouteState::EMPTY ||
+        rt->state == RouteState::STALE) {
+      return GateDecision{false, "route requires revalidation", true};
+    }
+  }
   if (auth.worker_boot != cur.worker_boot) return GateDecision{false, "worker boot not current", true};
   if (impl_->boot_fenced(auth.worker_boot)) return GateDecision{false, "fenced worker boot", true};
   if (cur.state != AssignmentState::ACTIVE) return GateDecision{false, "assignment not active", true};

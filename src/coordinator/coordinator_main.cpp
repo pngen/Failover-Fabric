@@ -102,9 +102,21 @@ struct SocketOps : CutoverOps {
 
 int main(int argc, char** argv) {
   std::uint16_t port = 0;
-  for (int i = 1; i < argc - 1; ++i) if (std::string(argv[i]) == "--port") port = (std::uint16_t)parse_u64(argv[i + 1]);
+  std::string load_path;
+  for (int i = 1; i < argc - 1; ++i) {
+    if (std::string(argv[i]) == "--port") port = (std::uint16_t)parse_u64(argv[i + 1]);
+    else if (std::string(argv[i]) == "--load") load_path = argv[i + 1];
+  }
   FailoverFabric fabric(RuntimeConfig{});
-  fabric.set_coordinator_identity(CoordinatorId(1), 1);
+  if (!load_path.empty()) {
+    try { fabric.load(load_path); } catch (const std::exception& e) { std::fprintf(stderr, "load failed: %s\n", e.what()); return 2; }
+    // Advanced epoch durably on restart; the persisted epoch is never reused as current.
+    auto old = fabric.current_epoch();
+    fabric.set_coordinator_identity(CoordinatorId(1), old.value() + 1);
+    std::fprintf(stderr, "coordinator restarted epoch=%llu revalidation=%zu\n", (unsigned long long)fabric.current_epoch().value(), fabric.revalidation_required_count());
+  } else {
+    fabric.set_coordinator_identity(CoordinatorId(1), 1);
+  }
   sock listen = net::tcp_listen(port);
   if (listen == kInvalidSocket) { std::fprintf(stderr, "coordinator: cannot bind\n"); return 1; }
   std::printf("PORT %u\n", (unsigned)net::tcp_listen_port(listen)); std::fflush(stdout);
@@ -123,7 +135,9 @@ int main(int argc, char** argv) {
           if (r.has(ex::fid::boot)) p->boot = r.u64(ex::fid::boot);
           if (r.has(ex::fid::req_port)) p->req_port = (std::uint16_t)r.u64(ex::fid::req_port);
           if (p->role == ex::kRoleWorker) { std::lock_guard<std::mutex> lk(g_pmu); g_workers[p->target] = p; }
-          else if (p->role == ex::kRoleGateway) { std::lock_guard<std::mutex> lk(g_pmu); g_gateways[p->boot] = p; fabric.set_gateway_boot(GatewayBootId(p->boot)); }
+          else if (p->role == ex::kRoleGateway) { std::lock_guard<std::mutex> lk(g_pmu); g_gateways[p->boot] = p; fabric.set_gateway_boot(GatewayBootId(p->boot));
+            // Push current routes to a (re)registered gateway so it can serve after restart.
+            for (auto sv : fabric.services()) { ServiceSlotKey sl{sv.service, ServiceSlotId(1)}; if (auto rt = fabric.current_route(sl)) { PayloadWriter rw; ex::encode_route_entry(rw, *rt); p->conn->send(MsgType::INSTALL_ROUTE, 2121, fabric.current_epoch().value(), rw.finish()); } } }
         }
         else if (f.type == MsgType::PUBLISH_READINESS) {
           PayloadReader r(f.payload);
@@ -205,6 +219,7 @@ int main(int argc, char** argv) {
           PayloadReader r(f.payload); ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
           PayloadWriter w; w.bool_(ex::fid::ok, fabric.current_assignment(slot).has_value());
           if (auto cur = fabric.current_assignment(slot)) w.u64(ex::fid::target, cur->target.value());
+          w.bool_(ex::fid::state, fabric.revalidation_required_count() > 0);
           p->conn->send(MsgType::QUERY_ROUTE, f.msg_id, f.epoch, w.finish());
         }
         else if (f.type == MsgType::AUTHORIZE_REQUEST) {

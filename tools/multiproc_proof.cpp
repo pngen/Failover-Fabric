@@ -92,16 +92,17 @@ bool coord_rpc(std::uint16_t cport, MsgType t, const std::vector<std::uint8_t>& 
   net::close_socket(c);
   return ok;
 }
-// Fresh-connection query of the current assignment target.
-std::uint64_t query_target(std::uint16_t cport, std::uint64_t service) {
+// Fresh-connection query: returns current target + revalidation-required flag.
+struct QueryResult { std::uint64_t target{0}; bool revalidation{false}; };
+QueryResult query_state(std::uint16_t cport, std::uint64_t service) {
+  QueryResult qr;
   sock c = net::tcp_connect("127.0.0.1", cport);
-  if (c == net::kInvalidSocket) return 0;
+  if (c == net::kInvalidSocket) return qr;
   { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
   PayloadWriter w; w.u64(ex::fid::service, service);
-  std::uint64_t target = 0;
-  if (send1(c, MsgType::QUERY_ROUTE, 7005, 0, w.finish())) { auto r = net::recv_frame(c); if (r) { PayloadReader q(r->payload); if (q.has(ex::fid::target)) target = q.u64(ex::fid::target); } }
+  if (send1(c, MsgType::QUERY_ROUTE, 7005, 0, w.finish())) { auto r = net::recv_frame(c); if (r) { PayloadReader q(r->payload); if (q.has(ex::fid::target)) qr.target = q.u64(ex::fid::target); if (q.has(ex::fid::state)) qr.revalidation = q.bool_(ex::fid::state); } }
   net::close_socket(c);
-  return target;
+  return qr;
 }
 
 bool gateway_request(std::uint16_t gport, std::uint64_t service, std::uint64_t a, std::uint64_t b, std::uint64_t& result) {
@@ -124,6 +125,26 @@ bool gateway_request(std::uint16_t gport, std::uint64_t service, std::uint64_t a
   return ret;
 }
 }  // namespace
+
+// A late result carrying OLD worker authority must be rejected after a cutover.
+bool stale_result_rejected(std::uint16_t cport, std::uint64_t service, std::uint64_t old_boot,
+                           std::uint64_t old_assg_gen, std::uint64_t old_route_gen, std::uint64_t req_id) {
+  sock c = net::tcp_connect("127.0.0.1", cport);
+  if (c == net::kInvalidSocket) return false;
+  { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
+  PayloadWriter w; w.u64(ex::fid::service, service); w.u64(ex::fid::slot, 1);
+  w.u64(ex::fid::epoch, 1); w.u64(ex::fid::epoch_id, 1); w.u64(ex::fid::epoch_boot, 1);
+  w.u64(ex::fid::assignment_id, 1); w.u64(ex::fid::assignment_gen, old_assg_gen);
+  w.u64(ex::fid::route_gen, old_route_gen); w.u64(ex::fid::boot, old_boot);
+  w.u64(ex::fid::incarnation, old_boot); w.u64(ex::fid::request_id, req_id); w.u64(ex::fid::execution_id, req_id);
+  bool rejected = false;
+  if (send1(c, MsgType::AUTHORIZE_RESULT, 7007, 0, w.finish())) {
+    auto r = net::recv_frame(c);
+    if (r && r->type == MsgType::AUTHORIZE_RESULT) { PayloadReader q(r->payload); rejected = !(q.has(ex::fid::ok) && q.bool_(ex::fid::ok)); }
+  }
+  net::close_socket(c);
+  return rejected;
+}
 
 int main(int argc, char** argv) {
   std::string dir = argc > 1 ? argv[1] : ".";
@@ -178,7 +199,7 @@ int main(int argc, char** argv) {
   std::printf("promoted=%s detail=%s\n", promoted ? "yes" : "no", fdetail.c_str());
 
   // Query current assignment target.
-  new_target = query_target(cport, SVC);
+  new_target = query_state(cport, SVC).target;
   std::printf("current_target=%llu\n", (unsigned long long)new_target);
 
   // 6. Serve through B (verify parity).
@@ -189,11 +210,42 @@ int main(int argc, char** argv) {
   // 7. Fresh A' (new boot) must not reclaim.
   Proc wa2 = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(A), "--boot", "42"});
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
-  new_target = query_target(cport, SVC);
+  new_target = query_state(cport, SVC).target;
   bool no_reclaim = (new_target == B);
   std::printf("fresh_A_no_reclaim=%s current_target=%llu\n", no_reclaim ? "OK" : "FAIL", (unsigned long long)new_target);
 
-  bool ok = a_served && promoted && b_served && no_reclaim && new_target == B;
+  // Old-worker authority must not be able to commit a result after the cutover.
+  bool stale_rejected = stale_result_rejected(cport, SVC, A, 1, 1, 4242);
+  std::printf("stale_late_result_rejected=%s\n", stale_rejected ? "OK" : "FAIL");
+  // ----------------------------------------------------------------- //
+  // Coordinator restart reconciliation (on the recovered state).
+  // ----------------------------------------------------------------- //
+  bool restart_ok = false; bool restart_revalidation = false; bool restart_old_epoch_rejected = false;
+  {
+    const char* state_path = "coord_state.ff";
+    { sock c = net::tcp_connect("127.0.0.1", cport); if (c != net::kInvalidSocket) {
+        { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
+        PayloadWriter w; w.str(ex::fid::detail, state_path);
+        send1(c, MsgType::SAVE, 7008, 0, w.finish());
+        auto r = net::recv_frame(c); net::close_socket(c); } }
+    kill_proc(coord);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    Proc coord2 = spawn(exe("ff_coordinator.exe"), {"--port", "0", "--load", state_path});
+    std::uint16_t cport2 = read_port(coord2.pipe);
+    if (cport2) {
+      QueryResult qs = query_state(cport2, SVC);
+      restart_revalidation = qs.revalidation;
+      bool recovered_b = (qs.target == B);
+      bool old_epoch_rejected = stale_result_rejected(cport2, SVC, A, 1, 1, 7777);   // old epoch auth
+      restart_old_epoch_rejected = old_epoch_rejected;
+      restart_ok = recovered_b && restart_revalidation && old_epoch_rejected;
+      kill_proc(coord2);
+    }
+    if (cport2) {}  // ensure cport2 is referenced for the recovered_b computation below
+    std::printf("coord_restart revalidation=%s old_epoch_rejected=%s\n",
+      restart_revalidation ? "OK" : "FAIL", restart_old_epoch_rejected ? "OK" : "FAIL");
+  }
+  bool ok = a_served && promoted && b_served && no_reclaim && new_target == B && stale_rejected && restart_ok;
   std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
   kill_proc(coord); kill_proc(gateway); kill_proc(wb); kill_proc(wa2);
   net::cleanup();
