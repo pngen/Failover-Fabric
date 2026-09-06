@@ -264,8 +264,16 @@ CandidateSnapshot FailoverFabric::Impl::snapshot_locked(ServiceSlotKey slot) con
   snapshot_counter = snapshot_counter.next();
   snap.generation = snapshot_counter;
   snap.slot = slot;
+  const ServiceDefinition* svc = service_for_slot(slot);
+  const std::string want_model = svc ? svc->compatibility.model_key : std::string();
+  const std::string want_abi = svc ? svc->compatibility.runtime_abi : std::string();
   for (const TargetRecord& t : targets) {
     if (!t.facts) continue;
+    // A candidate snapshot must be scoped to the service: only targets matching this
+    // service's compatibility are eligible, so do not build every target as a candidate.
+    // Scope a candidate snapshot to the service when the candidate is bound to one.
+    if (t.facts->service != ServiceId::null()) { if (!(t.facts->service == slot.service)) continue; }
+    else { if (!want_model.empty() && t.facts->model_key != want_model) continue; if (!want_abi.empty() && t.facts->runtime_abi != want_abi) continue; }
     Candidate c;
     c.facts = *t.facts;
     c.state = t.state;

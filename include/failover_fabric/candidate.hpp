@@ -21,6 +21,7 @@ namespace failover_fabric {
 struct CandidateFacts {
   TargetId target{TargetId::null()};
   TargetGeneration target_generation{TargetGeneration::null()};
+  ServiceId service{ServiceId::null()};   // the service this target is a candidate for
   ReplicaId replica{ReplicaId::null()};
   ReplicaGeneration replica_generation{ReplicaGeneration::null()};
   EngineId engine{EngineId::null()};

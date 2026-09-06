@@ -13,9 +13,9 @@ static std::uint64_t now_ms() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-static void reg(FailoverFabric& fab, TargetId t, WorkerBootId b) {
+static void reg(FailoverFabric& fab, TargetId t, WorkerBootId b, ServiceId svc) {
   fab.register_target(t, "bench");
-  CandidateFacts f; f.target = t; f.target_generation = TargetGeneration::first(); f.replica = ReplicaId(t.value());
+  CandidateFacts f; f.target = t; f.target_generation = TargetGeneration::first(); f.service = svc; f.replica = ReplicaId(t.value());
   f.engine = EngineId(t.value()); f.engine_incarnation = EngineIncarnationId(t.value()); f.worker = WorkerId(t.value());
   f.worker_boot = b; f.profile = ReadinessProfileId(1); f.model_key = "m"; f.runtime_abi = "a";
   f.ready = true; f.activation_eligible = true; f.evidence_fresh = true;
@@ -26,7 +26,11 @@ static void reg(FailoverFabric& fab, TargetId t, WorkerBootId b) {
 int main(int argc, char** argv) {
   int services = argc > 1 ? (int)std::strtoull(argv[1], nullptr, 10) : 100;
   int candidates = argc > 2 ? (int)std::strtoull(argv[2], nullptr, 10) : 4;
-  FailoverFabric fab;
+  RuntimeConfig cfg;
+  cfg.max_services = (std::size_t)(services + 16);
+  cfg.max_targets = (std::size_t)((services + 16) * (candidates + 2));
+  cfg.max_candidates_per_snapshot = (std::size_t)(candidates + 4);
+  FailoverFabric fab(cfg);
   std::uint64_t t0 = now_ms();
   for (int i = 0; i < services; ++i) {
     ServiceId sid(i + 2);
@@ -39,7 +43,7 @@ int main(int argc, char** argv) {
     Assignment a; a.id = AssignmentId(i + 1); a.generation = AssignmentGeneration::first(); a.slot = slot;
     a.target = TargetId(100 * (i + 1)); a.target_generation = TargetGeneration::first(); a.worker_boot = WorkerBootId(100 * (i + 1));
     a.authority_generation = ServiceAuthorityGeneration::first(); a.state = AssignmentState::ACTIVE; fab.set_initial_assignment(a);
-    for (int c = 0; c < candidates; ++c) reg(fab, TargetId(100 * (i + 1) + c + 1), WorkerBootId(100 * (i + 1) + c + 1));
+    for (int c = 0; c < candidates; ++c) reg(fab, TargetId(100 * (i + 1) + c + 1), WorkerBootId(100 * (i + 1) + c + 1), sid);
   }
   std::uint64_t t1 = now_ms();
   std::uint64_t select_ms = 0, plan_ms = 0, ev_ms = 0;
