@@ -68,10 +68,23 @@ int main(int argc, char** argv) {
       PayloadWriter w;
       // Admission: only an active worker whose own boot matches the requested authority may serve.
       if (active.load() && req_boot == my_boot) {
-        std::uint64_t res = ex::reference_result(a, b);
-        std::string rs = std::to_string(res);
-        w.bool_(ex::fid::ok, true);
-        std::vector<std::uint8_t> rb(rs.begin(), rs.end()); w.bytes(ex::fid::payload, rb);
+        if (a == 0xDBADu) {
+          // Sever the control connection but keep serving (live old-worker fencing).
+          net::close_socket(ctrl);
+          w.bool_(ex::fid::ok, true);
+        } else if (a == 0xBEEFu) {
+          // Computation happens; the response is withheld (in-flight ambiguity barrier).
+          std::uint64_t res = ex::reference_result(a & 0xFFFFFFFFFFFFu, b);
+          std::string of = "ambig_" + std::to_string(target) + ".out";
+          FILE* fp = fopen(of.c_str(), "w"); if (fp) { fprintf(fp, "%llu\n", (unsigned long long)res); fclose(fp); }
+          net::close_socket(c);  // withhold the response; peer sees EOF
+          return;
+        } else {
+          std::uint64_t res = ex::reference_result(a, b);
+          std::string rs = std::to_string(res);
+          w.bool_(ex::fid::ok, true);
+          std::vector<std::uint8_t> rb(rs.begin(), rs.end()); w.bytes(ex::fid::payload, rb);
+        }
       } else {
         w.bool_(ex::fid::ok, false); w.str(ex::fid::detail, "not active or stale boot");
       }

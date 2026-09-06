@@ -93,14 +93,14 @@ bool coord_rpc(std::uint16_t cport, MsgType t, const std::vector<std::uint8_t>& 
   return ok;
 }
 // Fresh-connection query: returns current target + revalidation-required flag.
-struct QueryResult { std::uint64_t target{0}; bool revalidation{false}; };
+struct QueryResult { std::uint64_t target{0}; bool revalidation{false}; std::uint64_t ambiguous{0}; };
 QueryResult query_state(std::uint16_t cport, std::uint64_t service) {
   QueryResult qr;
   sock c = net::tcp_connect("127.0.0.1", cport);
   if (c == net::kInvalidSocket) return qr;
   { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, 999); send1(c, MsgType::HELLO, 1, 0, h.finish()); }
   PayloadWriter w; w.u64(ex::fid::service, service);
-  if (send1(c, MsgType::QUERY_ROUTE, 7005, 0, w.finish())) { auto r = net::recv_frame(c); if (r) { PayloadReader q(r->payload); if (q.has(ex::fid::target)) qr.target = q.u64(ex::fid::target); if (q.has(ex::fid::state)) qr.revalidation = q.bool_(ex::fid::state); } }
+  if (send1(c, MsgType::QUERY_ROUTE, 7005, 0, w.finish())) { auto r = net::recv_frame(c); if (r) { PayloadReader q(r->payload); if (q.has(ex::fid::target)) qr.target = q.u64(ex::fid::target); if (q.has(ex::fid::state)) qr.revalidation = q.bool_(ex::fid::state); if (q.has(ex::fid::seq)) qr.ambiguous = q.u64(ex::fid::seq); } }
   net::close_socket(c);
   return qr;
 }
@@ -145,12 +145,108 @@ bool stale_result_rejected(std::uint16_t cport, std::uint64_t service, std::uint
   net::close_socket(c);
   return rejected;
 }
+// ------------------------------------------------------------------------- //
+// Scenario: live old-worker fencing (worker A stays physically alive; its control
+// connection is severed; a TRANSPORT_DISCONNECT triggers failover to B).
+// ------------------------------------------------------------------------- //
+static int run_live_fence(const std::string& dir, const char* worker_exe) {
+  auto exe = [&](const char* n) { return dir + "\\" + n; };
+  const std::uint64_t SVC = 1, A = 10, B = 11;
+  Proc coord = spawn(exe("ff_coordinator.exe"), {"--port", "0"});
+  std::uint16_t cport = read_port(coord.pipe); if (!cport) { std::fprintf(stderr, "live-fence: no cport\n"); return 1; }
+  Proc gateway = spawn(exe("ff_gateway.exe"), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--boot", "1"});
+  std::uint16_t gport = read_port(gateway.pipe);
+  Proc wa = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(A), "--boot", std::to_string(A)});
+  std::uint16_t aport = read_port(wa.pipe);
+  Proc wb = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(B), "--boot", std::to_string(B)});
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  sock gw = net::tcp_connect("127.0.0.1", gport);
+  if (gw == net::kInvalidSocket) { std::fprintf(stderr, "live-fence: no gateway\n"); return 1; }
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A); coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
+
+  // Phase 1: A serves.
+  std::uint64_t r1 = 0; bool a_served = gateway_request(gport, SVC, 3, 5, r1);
+
+  // Sever A's control connection; A stays alive (severs -> ok, still serves on request socket).
+  { sock c = net::tcp_connect("127.0.0.1", aport); if (c != net::kInvalidSocket) {
+      PayloadWriter w; w.u64(ex::fid::input_a, 0xDBADu); w.u64(ex::fid::input_b, 0); w.u64(ex::fid::boot, A);
+      send1(c, MsgType::VERIFY_SERVICE, 6001, 0, w.finish()); auto r = net::recv_frame(c); net::close_socket(c); } }
+
+  // A must still be alive: a direct probe to its request port must be served.
+  bool alive = false;
+  { sock c = net::tcp_connect("127.0.0.1", aport); if (c != net::kInvalidSocket) {
+      PayloadWriter w; w.u64(ex::fid::input_a, 1); w.u64(ex::fid::input_b, 1); w.u64(ex::fid::boot, A);
+      send1(c, MsgType::VERIFY_SERVICE, 6002, 0, w.finish()); auto r = net::recv_frame(c);
+      if (r && r->type == MsgType::EXECUTION_RESULT) { PayloadReader q(r->payload); alive = q.has(ex::fid::ok) && q.bool_(ex::fid::ok); }
+      net::close_socket(c); } }
+
+  // Transport disconnect evidence (without killing A).
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::target, A); w.u8(ex::fid::category, (std::uint8_t)FailureCategory::TRANSPORT_DISCONNECT); w.u64(ex::fid::seq, 2); coord_rpc(cport, MsgType::PUBLISH_FAILURE, w.finish(), t, d); }
+
+  // Failover to B through the actual governed fencing mechanism.
+  bool promoted = false; std::string fdet; MsgType tt;
+  for (int attempt = 0; attempt < 30 && !promoted; ++attempt) {
+    PayloadWriter w; w.u64(ex::fid::service, SVC);
+    if (coord_rpc(cport, MsgType::EXECUTE_FAILOVER, w.finish(), tt, fdet)) promoted = true;
+    else std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  }
+  QueryResult qs = query_state(cport, SVC);
+  bool current_b = (qs.target == B);
+  bool stale_rejected = stale_result_rejected(cport, SVC, A, 1, 1, 4242);
+  // A fresh replacement must not reclaim.
+  Proc wa2 = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(A), "--boot", "42"});
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  QueryResult qs2 = query_state(cport, SVC);
+  bool no_reclaim = (qs2.target == B);
+
+  std::printf("live_fence a_served=%s a_alive=%s promoted=%s current_b=%s stale_rejected=%s no_reclaim=%s\n",
+    a_served?"OK":"FAIL", alive?"OK":"FAIL", promoted?"OK":"FAIL", current_b?"OK":"FAIL", stale_rejected?"OK":"FAIL", no_reclaim?"OK":"FAIL");
+  bool ok = a_served && alive && promoted && current_b && stale_rejected && no_reclaim;
+  std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
+  net::close_socket(gw);
+  kill_proc(coord); kill_proc(gateway); kill_proc(wa); kill_proc(wb); kill_proc(wa2);
+  return ok ? 0 : 1;
+}
+
+// ------------------------------------------------------------------------- //
+// Scenario: in-flight ambiguity. A computes a reference result and withholds the
+// response; the gateway sees EOF and the request must not be reported as success.
+// ------------------------------------------------------------------------- //
+static int run_ambiguity(const std::string& dir, const char* worker_exe) {
+  auto exe = [&](const char* n) { return dir + "\\" + n; };
+  const std::uint64_t SVC = 1, A = 10, B = 11;
+  Proc coord = spawn(exe("ff_coordinator.exe"), {"--port", "0"});
+  std::uint16_t cport = read_port(coord.pipe); if (!cport) return 1;
+  Proc gateway = spawn(exe("ff_gateway.exe"), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--boot", "1"});
+  std::uint16_t gport = read_port(gateway.pipe);
+  Proc wa = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(A), "--boot", std::to_string(A)});
+  Proc wb = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(B), "--boot", std::to_string(B)});
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A); coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
+
+  // Dispatch a request that A will compute but for which A withholds the response.
+  std::uint64_t r = 0;
+  bool reported_success = gateway_request(gport, SVC, 0xBEEFu, 7, r);
+  std::string ambig_file = "ambig_" + std::to_string(A) + ".out";
+  bool computed = false;
+  { FILE* fp = fopen(ambig_file.c_str(), "r"); if (fp) { computed = true; fclose(fp); } }
+  std::remove(ambig_file.c_str());
+  // The request must not be reported as success.
+  bool not_success = !reported_success;
+  std::printf("ambiguity computed=%s reported_success=%s not_success=%s (ambiguous classification is proven in-process)\n",
+    computed?"OK":"FAIL", reported_success?"YES":"NO", not_success?"OK":"FAIL");
+  bool ok = computed && not_success;
+  std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
+  kill_proc(coord); kill_proc(gateway); kill_proc(wa); kill_proc(wb);
+  return ok ? 0 : 1;
+}
 
 int main(int argc, char** argv) {
   std::string dir = argc > 1 ? argv[1] : ".";
   bool use_cuda = false; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--cuda") use_cuda = true;
-  auto exe = [&](const char* n) { return dir + "\\" + n; };
   const char* worker_exe = use_cuda ? "ff_cuda_worker.exe" : "ff_worker.exe";
+  if (argc >= 3) { if (std::string(argv[2]) == "live-fence") return run_live_fence(dir, worker_exe); if (std::string(argv[2]) == "ambiguity") return run_ambiguity(dir, worker_exe); }
+  auto exe = [&](const char* n) { return dir + "\\" + n; };
   const std::uint64_t SVC = 1, A = 10, B = 11;
 
   // 1. Spawn + read control ports.

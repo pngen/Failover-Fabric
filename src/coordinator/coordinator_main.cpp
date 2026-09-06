@@ -220,6 +220,7 @@ int main(int argc, char** argv) {
           PayloadWriter w; w.bool_(ex::fid::ok, fabric.current_assignment(slot).has_value());
           if (auto cur = fabric.current_assignment(slot)) w.u64(ex::fid::target, cur->target.value());
           w.bool_(ex::fid::state, fabric.revalidation_required_count() > 0);
+          w.u64(ex::fid::seq, fabric.ambiguous_count());
           p->conn->send(MsgType::QUERY_ROUTE, f.msg_id, f.epoch, w.finish());
         }
         else if (f.type == MsgType::AUTHORIZE_REQUEST) {
