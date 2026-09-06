@@ -1,0 +1,2 @@
+add_executable(ff_examples examples.cpp)
+target_link_libraries(ff_examples PRIVATE FailoverFabric)

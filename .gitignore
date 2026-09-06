@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/build-*/
+/_install/
+/cmake-build-*/
+
+# Generated / temporary validation artifacts
+test_state.ff
+corrupt.ff
+*.ff.tmp
+scratch_client*
+iso_test.ps1
+
+# Editor / OS
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
