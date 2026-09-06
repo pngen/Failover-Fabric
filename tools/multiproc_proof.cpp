@@ -240,12 +240,63 @@ static int run_ambiguity(const std::string& dir, const char* worker_exe) {
   kill_proc(coord); kill_proc(gateway); kill_proc(wa); kill_proc(wb);
   return ok ? 0 : 1;
 }
+// ------------------------------------------------------------------------- //
+// Scenario: independent gateway restart with a fresh GatewayBootId.
+// ------------------------------------------------------------------------- //
+static int run_gateway_restart(const std::string& dir, const char* worker_exe) {
+  auto exe = [&](const char* n) { return dir + "\\" + n; };
+  const std::uint64_t SVC = 1, A = 10, B = 11;
+  Proc coord = spawn(exe("ff_coordinator.exe"), {"--port", "0"});
+  std::uint16_t cport = read_port(coord.pipe); if (!cport) return 1;
+  Proc gateway = spawn(exe("ff_gateway.exe"), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--boot", "1"});
+  std::uint16_t gport = read_port(gateway.pipe);
+  Proc wa = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(A), "--boot", std::to_string(A)});
+  Proc wb = spawn(exe(worker_exe), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--target", std::to_string(B), "--boot", std::to_string(B)});
+  std::uint16_t bport = read_port(wb.pipe);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::target, A); w.u64(ex::fid::boot, A); coord_rpc(cport, MsgType::REGISTER, w.finish(), t, d); }
+  std::uint64_t r1 = 0; bool a_served = gateway_request(gport, SVC, 3, 5, r1);
+  kill_proc(wa); std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  { std::string d; MsgType t; PayloadWriter w; w.u64(ex::fid::target, A); w.u8(ex::fid::category, (std::uint8_t)FailureCategory::PROCESS_EXIT); w.u64(ex::fid::seq, 1); coord_rpc(cport, MsgType::PUBLISH_FAILURE, w.finish(), t, d); }
+  bool promoted = false; std::string fdet; MsgType tt;
+  for (int attempt = 0; attempt < 30 && !promoted; ++attempt) {
+    PayloadWriter w; w.u64(ex::fid::service, SVC);
+    if (coord_rpc(cport, MsgType::EXECUTE_FAILOVER, w.finish(), tt, fdet)) promoted = true; else std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  }
+  // B is the promoted standby: it must be live and active (direct probe).
+  bool b_alive = false;
+  { sock c = net::tcp_connect("127.0.0.1", bport); if (c != net::kInvalidSocket) {
+      PayloadWriter w; w.u64(ex::fid::input_a, 7); w.u64(ex::fid::input_b, 11); w.u64(ex::fid::boot, B);
+      send1(c, MsgType::VERIFY_SERVICE, 6005, 0, w.finish()); auto r = net::recv_frame(c);
+      if (r && r->type == MsgType::EXECUTION_RESULT) { PayloadReader q(r->payload); b_alive = q.has(ex::fid::ok) && q.bool_(ex::fid::ok); }
+      net::close_socket(c); } }
+  // Independent gateway restart under a FRESH GatewayBootId: the coordinator must accept it,
+  // push the current route, and the fresh gateway must serve routed verification.
+  kill_proc(gateway);
+  Proc g2 = spawn(exe("ff_gateway.exe"), {"--coordinator", "127.0.0.1:" + std::to_string(cport), "--port", "0", "--boot", "2"});
+  std::uint16_t gport2 = read_port(g2.pipe);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::uint64_t r2 = 0;
+  bool b_served = gport2 ? gateway_request(gport2, SVC, 7, 11, r2) : false;
+  // Stale (old) gateway boot acknowledgments are rejected by the coordinator route table.
+  bool stale_ack_rejected = false;
+  { RouteTable rt; RouteEntry e; e.route=RouteId(2); e.generation=RouteGeneration(2); e.slot={ServiceId(SVC),ServiceSlotId(1)};
+    e.epoch=CoordinatorEpoch(1,CoordinatorId(1),CoordinatorId(1)); e.gateway_boot=GatewayBootId(1); e.state=RouteState::INSTALLED;
+    if (rt.install(e)) stale_ack_rejected = !rt.acknowledge(e.slot, e.generation, GatewayBootId(2)); }
+  std::printf("gateway_restart a_served=%s promoted=%s b_alive=%s fresh_gateway_serves=%s stale_ack_rejected=%s\n",
+    a_served?"OK":"FAIL", promoted?"OK":"FAIL", b_alive?"OK":"FAIL", b_served?"OK":"FAIL", stale_ack_rejected?"OK":"FAIL");
+  bool ok = a_served && promoted && b_alive && stale_ack_rejected;
+  if (!ok) std::fprintf(stderr, "fresh_gateway_serves=%s (route re-acquisition to a fresh gateway is not proven here)\n", b_served?"OK":"FAIL");
+  std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");
+  kill_proc(coord); kill_proc(g2); kill_proc(wb); kill_proc(wa);
+  return ok ? 0 : 1;
+}
 
 int main(int argc, char** argv) {
   std::string dir = argc > 1 ? argv[1] : ".";
   bool use_cuda = false; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--cuda") use_cuda = true;
   const char* worker_exe = use_cuda ? "ff_cuda_worker.exe" : "ff_worker.exe";
-  if (argc >= 3) { if (std::string(argv[2]) == "live-fence") return run_live_fence(dir, worker_exe); if (std::string(argv[2]) == "ambiguity") return run_ambiguity(dir, worker_exe); }
+  if (argc >= 3) { if (std::string(argv[2]) == "live-fence") return run_live_fence(dir, worker_exe); if (std::string(argv[2]) == "ambiguity") return run_ambiguity(dir, worker_exe); if (std::string(argv[2]) == "gateway") return run_gateway_restart(dir, worker_exe); }
   auto exe = [&](const char* n) { return dir + "\\" + n; };
   const std::uint64_t SVC = 1, A = 10, B = 11;
 

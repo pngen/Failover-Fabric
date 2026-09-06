@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
           if (p->role == ex::kRoleWorker) { std::lock_guard<std::mutex> lk(g_pmu); g_workers[p->target] = p; }
           else if (p->role == ex::kRoleGateway) { std::lock_guard<std::mutex> lk(g_pmu); g_gateways[p->boot] = p; fabric.set_gateway_boot(GatewayBootId(p->boot));
             // Push current routes to a (re)registered gateway so it can serve after restart.
-            for (auto sv : fabric.services()) { ServiceSlotKey sl{sv.service, ServiceSlotId(1)}; if (auto rt = fabric.current_route(sl)) { PayloadWriter rw; ex::encode_route_entry(rw, *rt); p->conn->send(MsgType::INSTALL_ROUTE, 2121, fabric.current_epoch().value(), rw.finish()); } } }
+            for (auto sv : fabric.services()) { ServiceSlotKey sl{sv.service, ServiceSlotId(1)}; if (auto rt = fabric.current_route(sl)) { RouteEntry re = *rt; { std::lock_guard<std::mutex> lk2(g_pmu); auto wit = g_workers.find(re.target.value()); if (wit != g_workers.end()) re.transport = "tcp://127.0.0.1:" + std::to_string(wit->second->req_port); } PayloadWriter rw; ex::encode_route_entry(rw, re); p->conn->send(MsgType::INSTALL_ROUTE, 2121, fabric.current_epoch().value(), rw.finish()); } } }
         }
         else if (f.type == MsgType::PUBLISH_READINESS) {
           PayloadReader r(f.payload);
