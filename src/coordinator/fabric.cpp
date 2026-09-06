@@ -5,6 +5,8 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <utility>
@@ -22,6 +24,7 @@ struct FailoverFabric::Impl {
   mutable std::shared_mutex mtx;
 
   std::vector<ServiceDefinition> services;
+  std::unordered_map<ServiceId, std::size_t> service_index;
   std::shared_ptr<Clock> clock;
 
   struct SlotState {
@@ -30,6 +33,7 @@ struct FailoverFabric::Impl {
     std::vector<Assignment> history;
   };
   std::vector<SlotState> slots;
+  std::unordered_map<ServiceSlotKey, std::size_t> slot_index;
 
   struct TargetRecord {
     TargetId id{TargetId::null()};
@@ -40,6 +44,8 @@ struct FailoverFabric::Impl {
     std::vector<CandidateResource> resources;
   };
   std::vector<TargetRecord> targets;
+  std::unordered_map<TargetId, std::size_t> target_index;
+  std::unordered_map<ServiceId, std::vector<std::size_t>> targets_by_service;
 
   EvidenceStore evidence;
   DomainRegistry domains;
@@ -65,17 +71,18 @@ struct FailoverFabric::Impl {
 
   std::vector<WorkerBootId> fenced_boots;
   std::vector<AttemptState> attempt_states;
+  std::unordered_set<TargetId> confirmed_failed_targets_;
   std::uint64_t receipt_seq_{0};
 
   explicit Impl(RuntimeConfig c) : cfg(std::move(c)), clock(std::make_shared<SteadyClock>()),
       last_authority_gen(ServiceAuthorityGeneration::first()) {}
   explicit Impl() : Impl(RuntimeConfig{}) {}
 
-  SlotState* find_slot(ServiceSlotKey s) { for (SlotState& x : slots) if (x.slot == s) return &x; return nullptr; }
-  const SlotState* find_slot(ServiceSlotKey s) const { for (const SlotState& x : slots) if (x.slot == s) return &x; return nullptr; }
-  TargetRecord* find_target(TargetId t) { for (TargetRecord& x : targets) if (x.id == t) return &x; return nullptr; }
-  const TargetRecord* find_target(TargetId t) const { for (const TargetRecord& x : targets) if (x.id == t) return &x; return nullptr; }
-  const ServiceDefinition* find_service(ServiceId id) const { for (const ServiceDefinition& s : services) if (s.service == id) return &s; return nullptr; }
+  SlotState* find_slot(ServiceSlotKey s) { auto it = slot_index.find(s); return it != slot_index.end() ? &slots[it->second] : nullptr; }
+  const SlotState* find_slot(ServiceSlotKey s) const { auto it = slot_index.find(s); return it != slot_index.end() ? &slots[it->second] : nullptr; }
+  TargetRecord* find_target(TargetId t) { auto it = target_index.find(t); return it != target_index.end() ? &targets[it->second] : nullptr; }
+  const TargetRecord* find_target(TargetId t) const { auto it = target_index.find(t); return it != target_index.end() ? &targets[it->second] : nullptr; }
+  const ServiceDefinition* find_service(ServiceId id) const { auto it = service_index.find(id); return it != service_index.end() ? &services[it->second] : nullptr; }
   const ServiceDefinition* service_for_slot(ServiceSlotKey slot) const { return find_service(slot.service); }
 
   AssignmentId next_assignment_id() { AssignmentId n = assignment_counter; assignment_counter = assignment_counter.next(); return n; }
@@ -144,6 +151,7 @@ void FailoverFabric::create_service(ServiceDefinition def) {
   for (const ServiceDefinition& s : impl_->services) {
     if (s.service == def.service) throw std::invalid_argument("service already exists with same identity");
   }
+  impl_->service_index[def.service] = impl_->services.size();
   impl_->services.push_back(std::move(def));
 }
 
@@ -176,7 +184,7 @@ void FailoverFabric::set_initial_assignment(Assignment a) {
   if (a.slot.service.is_null() || a.slot.slot.is_null()) throw std::invalid_argument("assignment slot is null");
   Impl::SlotState* st = impl_->find_slot(a.slot);
   if (st && st->current) throw std::logic_error("slot already has a current assignment");
-  if (!st) { impl_->slots.push_back(Impl::SlotState{a.slot, std::nullopt, {}}); st = &impl_->slots.back(); }
+  if (!st) { impl_->slot_index[a.slot] = impl_->slots.size(); impl_->slots.push_back(Impl::SlotState{a.slot, std::nullopt, {}}); st = &impl_->slots.back(); }
   a.state = AssignmentState::ACTIVE;
   a.provisory = false;
   if (a.authority_generation.is_null()) a.authority_generation = impl_->last_authority_gen;
@@ -212,7 +220,7 @@ const DomainRegistry& FailoverFabric::domains() const noexcept { return impl_->d
 void FailoverFabric::register_target(TargetId id, std::string transport) {
   std::unique_lock lk(impl_->mtx);
   if (impl_->targets.size() >= impl_->cfg.max_targets) throw CapacityExceeded("max_targets exceeded");
-  if (!impl_->find_target(id)) impl_->targets.push_back(Impl::TargetRecord{id, std::move(transport), std::nullopt, false, {}, {}});
+  if (!impl_->find_target(id)) { impl_->target_index[id] = impl_->targets.size(); impl_->targets.push_back(Impl::TargetRecord{id, std::move(transport), std::nullopt, false, {}, {}}); }
 }
 
 void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
@@ -221,6 +229,10 @@ void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
   if (!t) throw std::invalid_argument("target not registered");
   if (!t->facts || f.readiness_generation.value() >= t->facts->readiness_generation.value()) {
     f.evidence_fresh = true;
+    if (f.service != ServiceId::null()) {
+      bool same_svc = t->facts && (*t->facts).service == f.service;
+      if (!same_svc) impl_->targets_by_service[f.service].push_back((std::size_t)(t - impl_->targets.data()));
+    }
     t->facts = std::move(f);
   }
 }
@@ -246,6 +258,9 @@ void FailoverFabric::publish_candidate_resources(TargetId t, std::vector<Candida
 void FailoverFabric::publish_failure(FailureEvent ev) {
   std::unique_lock lk(impl_->mtx);
   if (ev.received.seq == 0) ev.received.seq = ++impl_->receipt_seq_;
+  if ((ev.status == EvidenceStatus::CONFIRMED || ev.status == EvidenceStatus::UNKNOWN) && ev.target) {
+    impl_->confirmed_failed_targets_.insert(*ev.target);
+  }
   impl_->evidence.publish(std::move(ev));
 }
 void FailoverFabric::clear_failure(FailureEventId id) {
@@ -267,22 +282,17 @@ CandidateSnapshot FailoverFabric::Impl::snapshot_locked(ServiceSlotKey slot) con
   const ServiceDefinition* svc = service_for_slot(slot);
   const std::string want_model = svc ? svc->compatibility.model_key : std::string();
   const std::string want_abi = svc ? svc->compatibility.runtime_abi : std::string();
-  for (const TargetRecord& t : targets) {
-    if (!t.facts) continue;
-    // A candidate snapshot must be scoped to the service: only targets matching this
-    // service's compatibility are eligible, so do not build every target as a candidate.
-    // Scope a candidate snapshot to the service when the candidate is bound to one.
-    if (t.facts->service != ServiceId::null()) { if (!(t.facts->service == slot.service)) continue; }
-    else { if (!want_model.empty() && t.facts->model_key != want_model) continue; if (!want_abi.empty() && t.facts->runtime_abi != want_abi) continue; }
+
+  // Emit a candidate for a target record at the given index.
+  auto emit = [&](std::size_t idx) {
+    const TargetRecord& t = targets[idx];
+    if (!t.facts) return;
     Candidate c;
     c.facts = *t.facts;
     c.state = t.state;
     c.resources = t.resources;
     c.domains = domains.domains_of(t.id);
-    for (FailureDomainId d : c.domains) {
-      auto anc = domains.ancestors_of(d);
-      c.domains.insert(c.domains.end(), anc.begin(), anc.end());
-    }
+    for (FailureDomainId d : c.domains) { auto anc = domains.ancestors_of(d); c.domains.insert(c.domains.end(), anc.begin(), anc.end()); }
     c.continuity = infer_continuity(t.state, *t.facts);
     c.costs.estimated_prep_ms = t.facts->ready ? 0 : 5000;
     c.costs.state_restore_ms = (t.has_state && t.state.state_available) ? 200 : 0;
@@ -291,6 +301,21 @@ CandidateSnapshot FailoverFabric::Impl::snapshot_locked(ServiceSlotKey slot) con
     c.costs.state_loss_sequences = (t.has_state && t.state.state_available) ? 0 : 1000;
     c.costs.cost_estimated = true;
     snap.candidates.push_back(std::move(c));
+  };
+
+  // Prefer the per-service index (O(candidates)); fall back to a compatibility-filtered scan
+  // for candidates that are not bound to this service (e.g. reference workers).
+  auto mit = targets_by_service.find(slot.service);
+  if (mit != targets_by_service.end() && !mit->second.empty()) {
+    for (std::size_t idx : mit->second) emit(idx);
+  } else {
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      const TargetRecord& t = targets[i];
+      if (!t.facts) continue;
+      if (!want_model.empty() && t.facts->model_key != want_model) continue;
+      if (!want_abi.empty() && t.facts->runtime_abi != want_abi) continue;
+      emit(i);
+    }
   }
   if (snap.candidates.size() > cfg.max_candidates_per_snapshot) snap.candidates.resize(cfg.max_candidates_per_snapshot);
   return snap;
@@ -300,9 +325,16 @@ SelectionContext FailoverFabric::Impl::build_context(ServiceSlotKey slot) const 
   SelectionContext ctx;
   ctx.now_receipt_seq = receipt_seq_;
   if (const SlotState* st = find_slot(slot)) if (st->current) ctx.failed_target = st->current->target;
-  for (const FailureEvent& e : evidence.all()) {
-    if (e.status == EvidenceStatus::CONFIRMED || e.status == EvidenceStatus::UNKNOWN) {
-      if (e.target) ctx.confirmed_failed_targets.push_back(*e.target);
+  // Scope confirmed-failed targets to this slot's candidates + current target, using the
+  // indexed confirmed-failed set rather than scanning the whole (growing) evidence store.
+  {
+    std::vector<TargetId> relevant;
+    if (auto mit = targets_by_service.find(slot.service); mit != targets_by_service.end()) {
+      for (std::size_t idx : mit->second) relevant.push_back(targets[idx].id);
+    }
+    if (ctx.failed_target != TargetId::null()) relevant.push_back(ctx.failed_target);
+    for (TargetId t : relevant) {
+      if (confirmed_failed_targets_.count(t)) ctx.confirmed_failed_targets.push_back(t);
     }
   }
   for (TargetId t : ctx.confirmed_failed_targets) {
@@ -654,14 +686,19 @@ void FailoverFabric::load(const std::string& path) {
   PersistenceSnapshot snap = persistence::load_file(path);
   std::unique_lock lk(impl_->mtx);
   impl_->services = std::move(snap.services);
+  impl_->service_index.clear();
+  for (std::size_t si = 0; si < impl_->services.size(); ++si) impl_->service_index[impl_->services[si].service] = si;
   impl_->epoch = snap.epoch;
   impl_->policy_gen = snap.policy_generation;
   impl_->last_authority_gen = snap.last_authority_gen;
   impl_->fenced_boots = std::move(snap.fenced_boots);
   impl_->slots.clear();
+  impl_->slot_index.clear();
+  impl_->target_index.clear();
+  impl_->targets_by_service.clear();
   for (Assignment& a : snap.assignments) {
     Impl::SlotState* st = impl_->find_slot(a.slot);
-    if (!st) { impl_->slots.push_back(Impl::SlotState{a.slot, std::nullopt, {}}); st = &impl_->slots.back(); }
+    if (!st) { impl_->slot_index[a.slot] = impl_->slots.size(); impl_->slots.push_back(Impl::SlotState{a.slot, std::nullopt, {}}); st = &impl_->slots.back(); }
     if (a.state == AssignmentState::ACTIVE) st->current = std::move(a);
     else st->history.push_back(std::move(a));
   }

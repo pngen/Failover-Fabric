@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,8 @@ class EvidenceStore {
   };
   using Container = std::vector<Entry>;
   Container events_;
+  std::unordered_map<FailureEventId, std::size_t> id_index_;
+  std::unordered_map<TargetId, std::vector<std::size_t>> target_index_;
   Container::iterator find_(FailureEventId id);
   Container::const_iterator find_(FailureEventId id) const;
 };

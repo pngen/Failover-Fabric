@@ -6,11 +6,13 @@
 namespace failover_fabric {
 
 EvidenceStore::Container::iterator EvidenceStore::find_(FailureEventId id) {
-  return std::find_if(events_.begin(), events_.end(), [&](const Entry& e) { return e.event.event_id == id; });
+  auto it = id_index_.find(id);
+  return it != id_index_.end() ? events_.begin() + (std::ptrdiff_t)it->second : events_.end();
 }
 
 EvidenceStore::Container::const_iterator EvidenceStore::find_(FailureEventId id) const {
-  return std::find_if(events_.begin(), events_.end(), [&](const Entry& e) { return e.event.event_id == id; });
+  auto it = id_index_.find(id);
+  return it != id_index_.end() ? events_.begin() + (std::ptrdiff_t)it->second : events_.end();
 }
 
 bool EvidenceStore::publish(FailureEvent ev) {
@@ -34,6 +36,8 @@ bool EvidenceStore::publish(FailureEvent ev) {
     }
     return false;  // stale
   }
+  id_index_[ev.event_id] = events_.size();
+  if (ev.target) target_index_[*ev.target].push_back(events_.size());
   events_.push_back(Entry{ev, ev.status == EvidenceStatus::CLEARED});
   return true;
 }
@@ -45,12 +49,13 @@ void EvidenceStore::clear(FailureEventId id) {
 
 std::optional<FailureEvent> EvidenceStore::latest_failure_for(TargetId target) const {
   std::optional<FailureEvent> result;
-  for (const Entry& e : events_) {
-    if (e.cleared) continue;
-    if (!e.event.target || *e.event.target != target) continue;
-    // Confirm/1..; only confirmed or high-severity suspected count as a live failure.
-    if (e.event.status == EvidenceStatus::CLEARED || e.event.status == EvidenceStatus::STALE) continue;
-    if (!result || e.event.received.seq >= result->received.seq) result = e.event;
+  if (auto it = target_index_.find(target); it != target_index_.end()) {
+    for (std::size_t idx : it->second) {
+      const Entry& e = events_[idx];
+      if (e.cleared) continue;
+      if (e.event.status == EvidenceStatus::CLEARED || e.event.status == EvidenceStatus::STALE) continue;
+      if (!result || e.event.received.seq >= result->received.seq) result = e.event;
+    }
   }
   return result;
 }
@@ -63,11 +68,13 @@ std::vector<FailureEvent> EvidenceStore::all() const {
 
 std::vector<FailureEvent> EvidenceStore::failures_for(TargetId target, std::size_t max) const {
   std::vector<FailureEvent> out;
-  for (const Entry& e : events_) {
-    if (e.cleared) continue;
-    if (!e.event.target || *e.event.target != target) continue;
-    if (e.event.status == EvidenceStatus::CLEARED || e.event.status == EvidenceStatus::STALE) continue;
-    out.push_back(e.event);
+  if (auto it = target_index_.find(target); it != target_index_.end()) {
+    for (std::size_t idx : it->second) {
+      const Entry& e = events_[idx];
+      if (e.cleared) continue;
+      if (e.event.status == EvidenceStatus::CLEARED || e.event.status == EvidenceStatus::STALE) continue;
+      out.push_back(e.event);
+    }
   }
   if (out.size() > max) out.resize(max);
   return out;

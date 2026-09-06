@@ -159,3 +159,12 @@ struct Assignment {
 };
 
 }  // namespace failover_fabric
+namespace std {
+template <> struct hash<failover_fabric::ServiceSlotKey> {
+  std::size_t operator()(const failover_fabric::ServiceSlotKey& k) const noexcept {
+    auto h1 = std::hash<failover_fabric::ServiceId>{}(k.service);
+    auto h2 = std::hash<failover_fabric::ServiceSlotId>{}(k.slot);
+    return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6) + (h1 >> 2));
+  }
+};
+}  // namespace std
