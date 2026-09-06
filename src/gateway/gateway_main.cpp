@@ -34,13 +34,8 @@ std::string worker_transport_for(std::uint64_t slot) {
 // Connect to the worker described by the route, send a compute request, read the result.
 std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t b, bool& ok) {
   ok = false;
-  std::string host = "127.0.0.1"; std::uint16_t port = 0;
-  // tcp://HOST:PORT — use the LAST colon (the port separator); the first colon is the scheme.
-  auto p = route.transport.rfind(":");
-  if (p != std::string::npos && route.transport.rfind("tcp://", 0) == 0) {
-    host = route.transport.substr(6, p - 6);
-    port = (std::uint16_t)parse_u64(route.transport.c_str() + p + 1);
-  }
+  std::string host; std::uint16_t port;
+  ex::parse_tcp_transport(route.transport, host, port);
   sock ws = net::tcp_connect(host, port);
   if (ws == kInvalidSocket) return "";
   PayloadWriter w; w.u64(ex::fid::input_a, a); w.u64(ex::fid::input_b, b);

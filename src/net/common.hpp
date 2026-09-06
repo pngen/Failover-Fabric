@@ -37,6 +37,19 @@ inline std::uint64_t reference_result(std::uint64_t a, std::uint64_t b) {
   return acc;
 }
 
+// Parse a tcp://HOST:PORT transport into host and port. Uses the LAST colon (the port
+// separator); the FIRST colon belongs to the "tcp://" scheme prefix.
+inline bool parse_tcp_transport(const std::string& transport, std::string& host, std::uint16_t& port) {
+  host = "127.0.0.1"; port = 0;
+  auto p = transport.rfind(":");
+  if (p != std::string::npos && transport.rfind("tcp://", 0) == 0) {
+    host = transport.substr(6, p - 6);
+    port = (std::uint16_t)std::strtoull(transport.c_str() + p + 1, nullptr, 10);
+    return true;
+  }
+  return false;
+}
+
 struct Message { std::uint32_t msg_id{0}; std::uint64_t epoch{0}; std::vector<std::uint8_t> payload; };
 
 inline bool send_msg(net::socket_t s, MsgType type, std::uint32_t msg_id, std::uint64_t epoch,
