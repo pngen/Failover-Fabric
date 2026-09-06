@@ -16,7 +16,7 @@ constexpr std::uint8_t role = 1, boot = 2, target = 3, service = 4, slot = 5, se
     source = 14, ok = 15, detail = 16, epoch = 17, route_gen = 18, assignment_gen = 19,
     request_id = 20, execution_id = 21, payload = 22, state = 23, transport = 24,
     operation = 25, incarnation = 26, host = 27, assignment_id = 28, gate_port = 29,
-    req_port = 30, input_a = 31, input_b = 32;
+    req_port = 30, input_a = 31, input_b = 32, epoch_id = 33, epoch_boot = 34;
 namespace route {
 constexpr std::uint8_t id = 40, gen = 41, target = 42, tgtgen = 43, inc = 44, boot = 45,
     assign = 46, assigngen = 47, routegen = 48, slot_service = 49, slot_id = 50,

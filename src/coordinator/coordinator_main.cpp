@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
   std::uint16_t port = 0;
   for (int i = 1; i < argc - 1; ++i) if (std::string(argv[i]) == "--port") port = (std::uint16_t)parse_u64(argv[i + 1]);
   FailoverFabric fabric(RuntimeConfig{});
+  fabric.set_coordinator_identity(CoordinatorId(1), 1);
   sock listen = net::tcp_listen(port);
   if (listen == kInvalidSocket) { std::fprintf(stderr, "coordinator: cannot bind\n"); return 1; }
   std::printf("PORT %u\n", (unsigned)net::tcp_listen_port(listen));
@@ -246,7 +247,7 @@ int main(int argc, char** argv) {
         if (!cur || cur->state != AssignmentState::ACTIVE) { w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"no current active assignment");}
         else {
           w.bool_(ex::fid::ok, true);
-          w.u64(ex::fid::epoch, fabric.current_epoch().value());
+          { auto ep = fabric.current_epoch(); w.u64(ex::fid::epoch, ep.value()); w.u64(ex::fid::epoch_id, ep.id().value()); w.u64(ex::fid::epoch_boot, ep.boot().value()); }
           w.u64(ex::fid::slot, slot.slot.value());
           w.u64(ex::fid::assignment_id, cur->id.value());
           w.u64(ex::fid::assignment_gen, cur->generation.value());
@@ -256,6 +257,22 @@ int main(int argc, char** argv) {
           w.u64(ex::fid::request_id, req.value());
           w.u64(ex::fid::execution_id, req.value());
           w.str(ex::fid::operation, "serve");
+          // Record the dispatch so the later AUTHORIZE_RESULT can validate it (and so a
+          // stale late result after a cutover is rejected).
+          {
+            WorkerAuthorization auth;
+            auth.epoch = fabric.current_epoch(); auth.slot = slot;
+            auth.assignment = cur->id; auth.assignment_generation = cur->generation;
+            auth.route_generation = cur->route_generation; auth.incarnation = cur->engine_incarnation;
+            auth.request = req; auth.execution = ExecutionId(req.value()); auth.operation = "serve";
+            auth.worker_boot = cur->worker_boot;
+            RequestRecord rec;
+            rec.request = req; rec.execution = ExecutionId(req.value()); rec.execution_generation = ExecutionGeneration::first();
+            rec.slot = slot; rec.disposition = RequestDisposition::DISPATCHED;
+            rec.idempotent = false; rec.authority = IdempotencyAuthority::NONE;
+            rec.externally_effectful = false; rec.dispatched_auth = auth;
+            fabric.record_request(rec);
+          }
         }
         ex::send_msg(c, MsgType::AUTHORIZE_REQUEST, f->msg_id, f->epoch, w.finish());
       }
@@ -263,7 +280,7 @@ int main(int argc, char** argv) {
         PayloadReader r(f->payload);
         ServiceId sid(r.u64(ex::fid::service)); ServiceSlotKey slot{sid, ServiceSlotId(1)};
         WorkerAuthorization auth;
-        auth.epoch = CoordinatorEpoch(r.u64(ex::fid::epoch), CoordinatorId(1), CoordinatorId(1));
+        auth.epoch = CoordinatorEpoch(r.u64(ex::fid::epoch), CoordinatorId(r.u64(ex::fid::epoch_id)), CoordinatorId(r.u64(ex::fid::epoch_boot)));
         auth.slot = slot;
         auth.assignment = AssignmentId(r.u64(ex::fid::assignment_id));
         auth.assignment_generation = AssignmentGeneration(r.u64(ex::fid::assignment_gen));

@@ -31,13 +31,15 @@ std::string worker_transport_for(std::uint64_t slot) {
   return it->second.transport;
 }
 
-// Connect to worker, send a compute request, read the result. Returns "" on failure.
+// Connect to the worker described by the route, send a compute request, read the result.
 std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t b, bool& ok) {
   ok = false;
   std::string host = "127.0.0.1"; std::uint16_t port = 0;
-  auto p = route.transport.find(":");
+  // tcp://HOST:PORT — use the LAST colon (the port separator); the first colon is the scheme.
+  auto p = route.transport.rfind(":");
   if (p != std::string::npos && route.transport.rfind("tcp://", 0) == 0) {
-    host = route.transport.substr(6, p - 6); port = (std::uint16_t)parse_u64(route.transport.c_str() + p + 1);
+    host = route.transport.substr(6, p - 6);
+    port = (std::uint16_t)parse_u64(route.transport.c_str() + p + 1);
   }
   sock ws = net::tcp_connect(host, port);
   if (ws == kInvalidSocket) return "";
@@ -56,21 +58,20 @@ std::string compute_on_worker(RouteEntry& route, std::uint64_t a, std::uint64_t 
 void handle_client(sock c) {
   auto f = net::recv_frame(c);
   if (!f) { net::close_socket(c); return; }
-  // Parse workload.
   std::uint64_t a = 0, b = 0; std::uint64_t slot = 1, service = 1;
   { PayloadReader r(f->payload); if (r.has(ex::fid::input_a)) a = r.u64(ex::fid::input_a); if (r.has(ex::fid::input_b)) b = r.u64(ex::fid::input_b);
     if (r.has(ex::fid::slot)) slot = r.u64(ex::fid::slot); if (r.has(ex::fid::service)) service = r.u64(ex::fid::service); }
   // Authorize dispatch with the coordinator.
   PayloadWriter ar; ar.u64(ex::fid::service, service); ar.u64(ex::fid::slot, slot); ar.u64(ex::fid::request_id, f->msg_id);
   PayloadWriter resp; resp.str(ex::fid::detail, "unknown");
-  std::uint64_t epoch=0, asg=0, asggen=0, rgen=0, boot=0, inc=0;
+  std::uint64_t epoch=0, ep_id=0, ep_boot=0, asg=0, asggen=0, rgen=0, boot=0, inc=0;
   bool auth_ok = false;
   {
     std::lock_guard<std::mutex> lk(g_rpc_mutex);
     if (ex::send_msg(g_rpc, MsgType::AUTHORIZE_REQUEST, f->msg_id, g_epoch, ar.finish())) {
       auto rr = net::recv_frame(g_rpc);
       if (rr && rr->type == MsgType::AUTHORIZE_REQUEST) { PayloadReader q(rr->payload); auth_ok = q.has(ex::fid::ok) && q.bool_(ex::fid::ok);
-        if (auth_ok) { epoch=q.u64(ex::fid::epoch); asg=q.u64(ex::fid::assignment_id); asggen=q.u64(ex::fid::assignment_gen); rgen=q.u64(ex::fid::route_gen); boot=q.u64(ex::fid::boot); inc=q.u64(ex::fid::incarnation); } }
+        if (auth_ok) { epoch=q.u64(ex::fid::epoch); ep_id=q.u64(ex::fid::epoch_id); ep_boot=q.u64(ex::fid::epoch_boot); asg=q.u64(ex::fid::assignment_id); asggen=q.u64(ex::fid::assignment_gen); rgen=q.u64(ex::fid::route_gen); boot=q.u64(ex::fid::boot); inc=q.u64(ex::fid::incarnation); } }
     }
   }
   if (!auth_ok) { resp.bool_(ex::fid::ok, false); resp.str(ex::fid::detail, "dispatch not authorized"); ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish()); net::close_socket(c); return; }
@@ -82,7 +83,8 @@ void handle_client(sock c) {
   std::string result = compute_on_worker(route, a, b, wok);
   // Authorize result with the coordinator.
   PayloadWriter ar2; ar2.u64(ex::fid::service, service); ar2.u64(ex::fid::slot, slot);
-  ar2.u64(ex::fid::epoch, epoch); ar2.u64(ex::fid::assignment_id, asg); ar2.u64(ex::fid::assignment_gen, asggen);
+  ar2.u64(ex::fid::epoch, epoch); ar2.u64(ex::fid::epoch_id, ep_id); ar2.u64(ex::fid::epoch_boot, ep_boot);
+  ar2.u64(ex::fid::assignment_id, asg); ar2.u64(ex::fid::assignment_gen, asggen);
   ar2.u64(ex::fid::route_gen, rgen); ar2.u64(ex::fid::boot, boot); ar2.u64(ex::fid::incarnation, inc);
   ar2.u64(ex::fid::request_id, f->msg_id); ar2.u64(ex::fid::execution_id, f->msg_id);
   bool res_ok = false;
@@ -92,7 +94,7 @@ void handle_client(sock c) {
       if (rr && rr->type == MsgType::AUTHORIZE_RESULT) { PayloadReader q(rr->payload); res_ok = q.has(ex::fid::ok) && q.bool_(ex::fid::ok); } } }
   bool parity = wok && result == std::to_string(ex::reference_result(a, b));
   resp.bool_(ex::fid::ok, res_ok && parity);
-  resp.bool_(ex::fid::state, parity);   // parity_ok
+  resp.bool_(ex::fid::state, parity);
   std::vector<std::uint8_t> rb(result.begin(), result.end());
   if (!rb.empty()) resp.bytes(ex::fid::payload, rb);
   ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish());
@@ -113,16 +115,13 @@ int main(int argc, char** argv) {
   if (listen == kInvalidSocket) { std::fprintf(stderr, "gateway: cannot bind\n"); return 1; }
   std::printf("PORT %u\n", (unsigned)net::tcp_listen_port(listen)); std::fflush(stdout);
 
-  // Register control socket.
   sock ctrl = net::tcp_connect(coord_host, coord_port);
   if (ctrl == kInvalidSocket) { std::fprintf(stderr, "gateway: cannot connect to coordinator\n"); return 1; }
   { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleGateway); h.u64(ex::fid::boot, boot); ex::send_msg(ctrl, MsgType::HELLO, 1, 0, h.finish()); }
-  // RPC socket for authority.
   g_rpc = net::tcp_connect(coord_host, coord_port);
   if (g_rpc == kInvalidSocket) { std::fprintf(stderr, "gateway: cannot open rpc socket\n"); return 1; }
   { PayloadWriter h; h.u8(ex::fid::role, ex::kRoleClient); h.u64(ex::fid::boot, boot); ex::send_msg(g_rpc, MsgType::HELLO, 2, 0, h.finish()); }
 
-  // Control-receive thread for INSTALL_ROUTE / VERIFY_SERVICE pushes.
   std::thread ctrl_thread([&] {
     while (true) {
       auto f = net::recv_frame(ctrl);
@@ -149,7 +148,6 @@ int main(int argc, char** argv) {
     }
   });
 
-  // Accept client connections on the request port.
   while (true) {
     sock c = net::tcp_accept(listen);
     if (c == kInvalidSocket) continue;
