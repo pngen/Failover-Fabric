@@ -1,3 +1,5 @@
+# Failover Fabric
+
 Failover Fabric is an open-source, vendor-neutral C++20 runtime for governing service failover, replacement selection, promotion authority, traffic cutover, failure-domain eligibility, and SLO-aware recovery across heterogeneous accelerator infrastructure.
 
 It answers one systems question:
