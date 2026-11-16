@@ -115,6 +115,9 @@ int main(int argc, char** argv) {
     // Advanced epoch durably on restart; the persisted epoch is never reused as current.
     auto old = fabric.current_epoch();
     fabric.set_coordinator_identity(CoordinatorId(1), old.value() + 1);
+    // The advanced epoch is made durable before any connection is served: a second restart
+    // from the same file must not issue this epoch again.
+    try { fabric.save(load_path); } catch (const std::exception& e) { std::fprintf(stderr, "cannot persist the advanced epoch: %s\n", e.what()); return 2; }
     std::fprintf(stderr, "coordinator restarted epoch=%llu revalidation=%zu\n", (unsigned long long)fabric.current_epoch().value(), fabric.revalidation_required_count());
   } else {
     fabric.set_coordinator_identity(CoordinatorId(1), 1);
@@ -312,6 +315,20 @@ int main(int argc, char** argv) {
             if (auto st = fabric.request_state(req)) {
               if (st->disposition == RequestDisposition::OUTCOME_UNKNOWN && !fabric.retry_allowed(req)) {
                 w.bool_(ex::fid::ok,false); w.str(ex::fid::detail,"non-retryable request; automatic replay refused");
+                p->conn->send(MsgType::AUTHORIZE_REQUEST, f.msg_id, f.epoch, w.finish());
+                return;
+              }
+            }
+            // Dispatch is authorized by the authority gate, not merely by an ACTIVE field: a
+            // fenced worker boot or a route that requires revalidation gets no new work.
+            {
+              WorkerAuthorization gate; gate.epoch = fabric.current_epoch(); gate.slot = slot; gate.assignment = cur->id;
+              gate.assignment_generation = cur->generation; gate.route_generation = cur->route_generation;
+              gate.incarnation = cur->engine_incarnation; gate.request = req; gate.execution = ExecutionId(req.value());
+              gate.operation = "serve"; gate.worker_boot = cur->worker_boot;
+              const GateDecision gd = fabric.authorize_dispatch(gate);
+              if (!gd.allowed) {
+                w.bool_(ex::fid::ok,false); w.str(ex::fid::detail, gd.reason);
                 p->conn->send(MsgType::AUTHORIZE_REQUEST, f.msg_id, f.epoch, w.finish());
                 return;
               }

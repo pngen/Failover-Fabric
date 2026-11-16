@@ -56,23 +56,33 @@ struct FailoverFabric::Impl {
   CoordinatorEpoch epoch;
   PolicyGeneration policy_gen;
   ServiceAuthorityGeneration last_authority_gen;
-  mutable CandidateSnapshotGeneration snapshot_counter;
-  AssignmentId assignment_counter{AssignmentId::min_id()};
+  // Allocators. Each holds the last value issued or observed, so an identity or generation
+  // is never handed out twice: not to two attempts, not after an initial assignment that
+  // carries its own identity, and not after recovery. Snapshots and plans are produced under
+  // a shared lock, so their sequences are atomic.
+  mutable std::atomic<std::uint64_t> snapshot_seq{1};
+  mutable std::atomic<std::uint64_t> plan_seq{1};
+  mutable std::atomic<std::uint64_t> route_id_seq{1};
+  AssignmentId assignment_counter{AssignmentId::null()};
   AssignmentGeneration assignment_gen_counter;
   FailoverAttemptId attempt_counter{FailoverAttemptId::min_id()};
   FailoverAttemptGeneration attempt_gen_counter;
-  FailoverPlanId plan_counter{FailoverPlanId::min_id()};
-  FailoverPlanGeneration plan_gen_counter;
-  RouteId route_counter{RouteId::min_id()};
-  RouteGeneration route_gen_counter;
   ActivationId activation_counter{ActivationId::min_id()};
   ActivationGeneration activation_gen_counter;
+  ServiceAuthorityGeneration authority_alloc{ServiceAuthorityGeneration::first()};
   GatewayBootId gateway_boot;
   CoordinatorId coordinator_id{CoordinatorId::min_id()};
 
   std::vector<WorkerBootId> fenced_boots;
   std::vector<AttemptState> attempt_states;
   std::unordered_set<TargetId> confirmed_failed_targets_;
+  // The worker boot a target had when its failure was confirmed. That boot cannot lift the
+  // failure by repeating a healthy observation; only a new incarnation or an explicit clear can.
+  std::unordered_map<TargetId, WorkerBootId> failed_boot_;
+  // Events cleared explicitly. They are persisted as CLEARED so a restart does not revive them.
+  std::unordered_set<FailureEventId> cleared_events_;
+  // Active failure evidence that names failure domains (not only a target).
+  std::unordered_map<FailureEventId, std::vector<FailureDomainId>> domain_failures_;
   std::uint64_t receipt_seq_{0};
 
   // Failback / anti-flapping bookkeeping. The preferred target is the service's target of
@@ -112,7 +122,33 @@ struct FailoverFabric::Impl {
   const ServiceDefinition* find_service(ServiceId id) const { auto it = service_index.find(id); return it != service_index.end() ? &services[it->second] : nullptr; }
   const ServiceDefinition* service_for_slot(ServiceSlotKey slot) const { return find_service(slot.service); }
 
-  AssignmentId next_assignment_id() { AssignmentId n = assignment_counter; assignment_counter = assignment_counter.next(); return n; }
+  template <typename C> static C issue(C& counter) { counter = counter.next(); return counter; }
+  template <typename C> static void observe(C& counter, const C& seen) { if (seen > counter) counter = seen; }
+  AssignmentId next_assignment_id() { return issue(assignment_counter); }
+  void observe_route_id(RouteId id) const {
+    std::uint64_t cur = route_id_seq.load();
+    while (id.value() > cur && !route_id_seq.compare_exchange_weak(cur, id.value())) {}
+  }
+  // Record every identity and generation an existing assignment already uses.
+  void observe_assignment(const Assignment& a) {
+    observe(assignment_counter, a.id);
+    observe(assignment_gen_counter, a.generation);
+    observe(activation_counter, a.activation);
+    observe(activation_gen_counter, a.activation_generation);
+    observe(authority_alloc, a.authority_generation);
+    observe_route_id(a.route);
+  }
+  // Rebuild the failure indexes from one evidence event.
+  void index_failure(const FailureEvent& ev) {
+    if (ev.status != EvidenceStatus::CONFIRMED && ev.status != EvidenceStatus::UNKNOWN) return;
+    if (ev.target) {
+      confirmed_failed_targets_.insert(*ev.target);
+      if (const TargetRecord* t = find_target(*ev.target); t && t->facts) failed_boot_[*ev.target] = t->facts->worker_boot;
+    }
+    std::vector<FailureDomainId> doms = ev.affected_domains;
+    if (ev.domain) doms.push_back(*ev.domain);
+    if (!doms.empty()) domain_failures_[ev.event_id] = std::move(doms);
+  }
   bool boot_fenced(WorkerBootId b) const { return std::find(fenced_boots.begin(), fenced_boots.end(), b) != fenced_boots.end(); }
   void add_fenced_boot(WorkerBootId b) { if (!b.is_null() && !boot_fenced(b)) fenced_boots.push_back(b); }
 
@@ -215,6 +251,7 @@ void FailoverFabric::set_initial_assignment(Assignment a) {
   a.state = AssignmentState::ACTIVE;
   a.provisory = false;
   if (a.authority_generation.is_null()) a.authority_generation = impl_->last_authority_gen;
+  impl_->observe_assignment(a);          // never reissue this assignment's identity
   impl_->preferred[a.slot] = a.target;   // target of record / failback home
   impl_->last_transition[a.slot] = impl_->clock->now();
   impl_->failback_attempts[a.slot] = 0;
@@ -240,8 +277,8 @@ std::vector<Assignment> FailoverFabric::assignment_history(ServiceSlotKey slot, 
 // --------------------------------------------------------------------------- //
 // Domains
 // --------------------------------------------------------------------------- //
-void FailoverFabric::declare_domain(DomainDecl d) { impl_->domains.declare(d); }
-void FailoverFabric::set_membership(DomainMembership m) { impl_->domains.set_membership(m); }
+void FailoverFabric::declare_domain(DomainDecl d) { std::unique_lock lk(impl_->mtx); impl_->domains.declare(d); }
+void FailoverFabric::set_membership(DomainMembership m) { std::unique_lock lk(impl_->mtx); impl_->domains.set_membership(m); }
 const DomainRegistry& FailoverFabric::domains() const noexcept { return impl_->domains; }
 
 // --------------------------------------------------------------------------- //
@@ -257,6 +294,8 @@ void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
   std::unique_lock lk(impl_->mtx);
   Impl::TargetRecord* t = impl_->find_target(f.target);
   if (!t) throw std::invalid_argument("target not registered");
+  // A fenced worker boot must not republish its target as current.
+  if (impl_->boot_fenced(f.worker_boot)) throw std::invalid_argument("worker boot is fenced");
   if (!t->facts || f.readiness_generation.value() >= t->facts->readiness_generation.value()) {
     f.evidence_fresh = true;
     if (f.service != ServiceId::null()) {
@@ -266,10 +305,15 @@ void FailoverFabric::publish_candidate_facts(CandidateFacts f) {
     // A fresh, ready incarnation is recovery evidence for the target: a brand-new worker
     // boot publishing current health means the target recovered, so it must no longer be
     // treated as a confirmed-failed target (otherwise a recovered/preferred target could
-    // never be a failback candidate). This does not clear an older healthy observation
-    // over a NEWER confirmed failure of the SAME incarnation.
+    // never be a failback candidate). A healthy observation from the SAME incarnation
+    // whose failure was confirmed never erases that failure: it is lifted only by a new
+    // worker boot or by an explicit clear of the failure evidence.
     if (f.ready && (impl_->confirmed_failed_targets_.count(f.target))) {
-      impl_->confirmed_failed_targets_.erase(f.target);
+      const auto fb = impl_->failed_boot_.find(f.target);
+      if (fb == impl_->failed_boot_.end() || fb->second != f.worker_boot) {
+        impl_->confirmed_failed_targets_.erase(f.target);
+        impl_->failed_boot_.erase(f.target);
+      }
     }
     // Hysteresis stability window: record when this target last became fresh+ready, so a
     // failback to it must observe it stably ready for the configured hysteresis duration.
@@ -299,14 +343,26 @@ void FailoverFabric::publish_candidate_resources(TargetId t, std::vector<Candida
 void FailoverFabric::publish_failure(FailureEvent ev) {
   std::unique_lock lk(impl_->mtx);
   if (ev.received.seq == 0) ev.received.seq = ++impl_->receipt_seq_;
-  if ((ev.status == EvidenceStatus::CONFIRMED || ev.status == EvidenceStatus::UNKNOWN) && ev.target) {
-    impl_->confirmed_failed_targets_.insert(*ev.target);
-  }
-  impl_->evidence.publish(std::move(ev));
+  const bool failing = ev.status == EvidenceStatus::CONFIRMED || ev.status == EvidenceStatus::UNKNOWN;
+  const FailureEventId id = ev.event_id;
+  impl_->index_failure(ev);
+  // A failure published again under an id that was cleared is active again.
+  if (impl_->evidence.publish(std::move(ev)) && failing) impl_->cleared_events_.erase(id);
 }
 void FailoverFabric::clear_failure(FailureEventId id) {
   std::unique_lock lk(impl_->mtx);
   impl_->evidence.clear(id);
+  impl_->cleared_events_.insert(id);
+  impl_->domain_failures_.erase(id);
+  // An explicit clear lifts the target's exclusion once no other active failure remains.
+  for (const FailureEvent& e : impl_->evidence.all()) {
+    if (e.event_id != id) continue;
+    if (e.target && !impl_->evidence.latest_failure_for(*e.target)) {
+      impl_->confirmed_failed_targets_.erase(*e.target);
+      impl_->failed_boot_.erase(*e.target);
+    }
+    break;
+  }
 }
 std::vector<FailureEvent> FailoverFabric::failures_for(TargetId t, std::size_t max) const {
   std::shared_lock lk(impl_->mtx);
@@ -317,8 +373,7 @@ std::vector<FailureEvent> FailoverFabric::failures_for(TargetId t, std::size_t m
 // --------------------------------------------------------------------------- //
 CandidateSnapshot FailoverFabric::Impl::snapshot_locked(ServiceSlotKey slot) const {
   CandidateSnapshot snap;
-  snapshot_counter = snapshot_counter.next();
-  snap.generation = snapshot_counter;
+  snap.generation = CandidateSnapshotGeneration(snapshot_seq.fetch_add(1) + 1);
   snap.slot = slot;
   const ServiceDefinition* svc = service_for_slot(slot);
   const std::string want_model = svc ? svc->compatibility.model_key : std::string();
@@ -370,8 +425,22 @@ SelectionContext FailoverFabric::Impl::build_context(ServiceSlotKey slot) const 
   // indexed confirmed-failed set rather than scanning the whole (growing) evidence store.
   {
     std::vector<TargetId> relevant;
-    if (auto mit = targets_by_service.find(slot.service); mit != targets_by_service.end()) {
+    auto mit = targets_by_service.find(slot.service);
+    if (mit != targets_by_service.end() && !mit->second.empty()) {
       for (std::size_t idx : mit->second) relevant.push_back(targets[idx].id);
+    } else {
+      // Candidates that are not bound to a service come from the compatibility scan in
+      // snapshot_locked. Failure evidence about them counts just the same: a standby with a
+      // confirmed failure must not be selected because its facts carry no service id.
+      const ServiceDefinition* svc = service_for_slot(slot);
+      const std::string want_model = svc ? svc->compatibility.model_key : std::string();
+      const std::string want_abi = svc ? svc->compatibility.runtime_abi : std::string();
+      for (const TargetRecord& t : targets) {
+        if (!t.facts) continue;
+        if (!want_model.empty() && t.facts->model_key != want_model) continue;
+        if (!want_abi.empty() && t.facts->runtime_abi != want_abi) continue;
+        relevant.push_back(t.id);
+      }
     }
     if (ctx.failed_target != TargetId::null()) relevant.push_back(ctx.failed_target);
     for (TargetId t : relevant) {
@@ -382,8 +451,12 @@ SelectionContext FailoverFabric::Impl::build_context(ServiceSlotKey slot) const 
     for (FailureDomainId d : domains.domains_of(t)) ctx.failed_domains.push_back(d);
   }
   auto uniq = [](auto& v) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); };
+  for (const auto& kv : domain_failures_) {
+    ctx.failed_domain_evidence.insert(ctx.failed_domain_evidence.end(), kv.second.begin(), kv.second.end());
+  }
   uniq(ctx.confirmed_failed_targets);
   uniq(ctx.failed_domains);
+  uniq(ctx.failed_domain_evidence);
   ctx.fenced_boots = fenced_boots;
   if (auto r = routes.current(slot)) ctx.current_route_gen = r->generation;
   return ctx;
@@ -436,8 +509,9 @@ std::optional<FailoverPlan> FailoverFabric::plan_failover_pref(ServiceSlotKey sl
   SelectionResult sr = SelectionEngine().select(snap, *svc, impl_->domains, ctx);
   if (!sr.has_selection || !sr.selected) return std::nullopt;
   FailoverPlan plan;
-  plan.plan = impl_->plan_counter.next();
-  plan.generation = impl_->plan_gen_counter.next();
+  const std::uint64_t plan_no = impl_->plan_seq.fetch_add(1) + 1;
+  plan.plan = FailoverPlanId(plan_no);
+  plan.generation = FailoverPlanGeneration(plan_no);
   plan.slot = slot;
   if (const Impl::SlotState* st = impl_->find_slot(slot)) if (st->current) plan.source_assignment = st->current;
   plan.triggering_evidence = impl_->evidence.failures_for(ctx.failed_target, 4);
@@ -449,7 +523,7 @@ std::optional<FailoverPlan> FailoverFabric::plan_failover_pref(ServiceSlotKey sl
       "reference coordinator/gateway/worker gates enforce generation-bound authority"};
   plan.recovery_objective = svc->recovery;
   if (auto r = impl_->routes.current(slot)) { plan.requested_route = r->route; plan.requested_route_generation = r->generation.next(); }
-  else { plan.requested_route = impl_->route_counter.next(); plan.requested_route_generation = impl_->route_gen_counter.next(); }
+  else { plan.requested_route = RouteId(impl_->route_id_seq.fetch_add(1) + 1); plan.requested_route_generation = RouteGeneration::first().next(); }
   plan.record_milestone(Milestone::INTENT_ONLY);
   return plan;
 }
@@ -465,11 +539,14 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
   Candidate selected;
   bool valid = false;
   std::string invalid_reason;
+  CoordinatorEpoch epoch_now;
   // Durable cutover checkpoint: record the reached milestone + pending transaction, save a
   // checkpoint if one is configured, and report whether the configured barrier was reached so
   // the caller/coordinator can terminate and restart to exercise interrupted-cutover recovery.
   auto checkpoint = [&](Milestone m, const std::optional<Assignment>& pend,
                         const std::optional<Assignment>& src, const std::optional<RouteEntry>& rt) {
+    std::string path;
+    bool barrier = false;
     {
       std::unique_lock lk2(impl_->mtx);
       impl_->has_txn = true;
@@ -477,15 +554,18 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
       impl_->pending_assignment = pend;
       impl_->source_assignment = src;
       impl_->pending_route = rt;
+      path = impl_->checkpoint_path;
+      barrier = impl_->barrier_milestone == m;
     }
-    if (!impl_->checkpoint_path.empty()) save(impl_->checkpoint_path);
-    return impl_->barrier_milestone == m;
+    if (!path.empty()) save(path);
+    return barrier;
   };
   {
     std::unique_lock lk(impl_->mtx);
-    result.attempt = impl_->attempt_counter.next();
-    result.generation = impl_->attempt_gen_counter.next();
+    result.attempt = Impl::issue(impl_->attempt_counter);
+    result.generation = Impl::issue(impl_->attempt_gen_counter);
     result.state = AttemptState::REQUESTED;
+    epoch_now = impl_->epoch;
     const ServiceDefinition* svcp = impl_->service_for_slot(slot);
     if (!svcp) invalid_reason = "service not registered";
     else if (!plan.selected) invalid_reason = "plan has no selected candidate";
@@ -511,7 +591,7 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
       }
       if (invalid_reason.empty()) {
         new_assign.id = impl_->next_assignment_id();
-        new_assign.generation = impl_->assignment_gen_counter.next();
+        new_assign.generation = Impl::issue(impl_->assignment_gen_counter);
         new_assign.slot = slot;
         new_assign.target = selected.facts.target;
         new_assign.target_generation = selected.facts.target_generation;
@@ -520,9 +600,13 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
         new_assign.engine = selected.facts.engine;
         new_assign.engine_incarnation = selected.facts.engine_incarnation;
         new_assign.readiness_profile = selected.facts.profile;
-        new_assign.authority_generation = impl_->last_authority_gen.next();
-        new_assign.activation = impl_->activation_counter.next();
-        new_assign.activation_generation = impl_->activation_gen_counter.next();
+        // Every attempt is authorized under its own authority generation, also when two
+        // attempts compete: the loser's activation must not share the winner's generation.
+        Impl::observe(impl_->authority_alloc, impl_->last_authority_gen);
+        new_assign.authority_generation = Impl::issue(impl_->authority_alloc);
+        new_assign.activation = Impl::issue(impl_->activation_counter);
+        new_assign.activation_generation = Impl::issue(impl_->activation_gen_counter);
+        impl_->observe_route_id(plan.requested_route);
         new_assign.route = plan.requested_route;
         new_assign.route_generation = plan.requested_route_generation;
         new_assign.worker_boot = selected.facts.worker_boot;
@@ -568,7 +652,7 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
   }
 
   // ---- Authorize + activate replacement ----
-  WorkerAuthorization auth = make_auth(impl_->epoch, new_assign, selected, RequestId(1), ExecutionId(1), "serve");
+  WorkerAuthorization auth = make_auth(epoch_now, new_assign, selected, RequestId(1), ExecutionId(1), "serve");
   ActivateOutcome ao = ops.activate(selected, auth, new_assign.authority_generation);
   {
     std::unique_lock lk(impl_->mtx);
@@ -595,15 +679,38 @@ AttemptResult FailoverFabric::execute_plan(const FailoverPlan& plan, CutoverOps&
   re.permitted_boot = selected.facts.worker_boot;
   re.assignment = new_assign.id;
   re.assignment_generation = new_assign.generation;
-  re.epoch = impl_->epoch;
-  re.gateway_boot = impl_->gateway_boot;
-  re.state = RouteState::ACKNOWLEDGED;
+  re.state = RouteState::INSTALLED;
   re.transport = "pipes/" + std::to_string(selected.facts.target.value());
-  RouteOutcome ro = ops.install_route(re, impl_->gateway_boot);
+  GatewayBootId gateway_boot;
+  {
+    // The route table is the dispatch authority. The new generation is installed there
+    // first: a route that is not strictly newer belongs to an attempt that lost to a
+    // competing cutover, and it must stop here, before it reaches the gateway.
+    std::unique_lock lk(impl_->mtx);
+    re.epoch = impl_->epoch;
+    re.gateway_boot = impl_->gateway_boot;
+    gateway_boot = impl_->gateway_boot;
+    if (!impl_->routes.install(re)) {
+      impl_->attempt_states.push_back(AttemptState::SUPERSEDED);
+      result.state = AttemptState::SUPERSEDED;
+      result.detail = "route generation superseded by a competing cutover";
+      return result;
+    }
+  }
+  RouteEntry pushed = re;
+  pushed.state = RouteState::ACKNOWLEDGED;
+  RouteOutcome ro = ops.install_route(pushed, gateway_boot);
   {
     std::unique_lock lk(impl_->mtx);
     if (!ro.acknowledged) { impl_->attempt_states.push_back(AttemptState::RECOVERY_REQUIRED); result.state = AttemptState::RECOVERY_REQUIRED; result.detail = "route not acknowledged: " + ro.detail; return result; }
-    impl_->routes.install(re);
+    // The acknowledgment counts only for the route still installed for this gateway boot.
+    if (!impl_->routes.acknowledge(slot, re.generation, gateway_boot)) {
+      impl_->attempt_states.push_back(AttemptState::SUPERSEDED);
+      result.state = AttemptState::SUPERSEDED;
+      result.detail = "route superseded before the gateway acknowledgment was recorded";
+      return result;
+    }
+    re.state = RouteState::ACKNOWLEDGED;
     result.reached = Milestone::ROUTE_INSTALLED;
     result.state = AttemptState::VERIFYING;
   }
@@ -735,7 +842,13 @@ AttemptResult FailoverFabric::execute_failback(ServiceSlotKey slot, CutoverOps& 
     return r;
   }
   std::optional<TargetId> pref;
-  { std::shared_lock lk(impl_->mtx); auto it = impl_->preferred.find(slot); if (it != impl_->preferred.end()) pref = it->second; }
+  {
+    // A manual authorization covers one failback attempt: this attempt spends it.
+    std::unique_lock lk(impl_->mtx);
+    impl_->manual_failback_authorized.erase(slot);
+    auto it = impl_->preferred.find(slot);
+    if (it != impl_->preferred.end()) pref = it->second;
+  }
   if (!pref) { AttemptResult r; r.state = AttemptState::FAILED; r.detail = "no preferred target"; return r; }
   std::optional<FailoverPlan> plan = plan_failover_pref(slot, pref);
   if (!plan || !plan->selected) {
@@ -846,6 +959,7 @@ GateDecision FailoverFabric::authorize_result(const WorkerAuthorization& auth) c
 bool FailoverFabric::install_route(RouteEntry entry, GatewayBootId boot) {
   std::unique_lock lk(impl_->mtx);
   if (entry.epoch != impl_->epoch) return false;
+  impl_->observe_route_id(entry.route);
   entry.state = RouteState::ACKNOWLEDGED;
   entry.gateway_boot = boot;
   return impl_->routes.install(std::move(entry));
@@ -876,6 +990,8 @@ ServiceOutcome FailoverFabric::service_outcome(ServiceSlotKey slot) const {
   if (!st || !st->current) return ServiceOutcome::UNAVAILABLE;
   auto r = impl_->routes.current(slot);
   if (r && r->state == RouteState::REVALIDATION_REQUIRED) return ServiceOutcome::REVALIDATION_REQUIRED;
+  // A fenced assignment serves nothing: the gate refuses its worker boot.
+  if (impl_->boot_fenced(st->current->worker_boot)) return ServiceOutcome::UNAVAILABLE;
   if (st->current->state == AssignmentState::ACTIVE && r && r->state == RouteState::ACKNOWLEDGED) {
     if (impl_->evidence.latest_failure_for(st->current->target)) return ServiceOutcome::DEGRADED;
     return ServiceOutcome::AVAILABLE;
@@ -905,6 +1021,9 @@ void FailoverFabric::save(const std::string& path) const {
     snap.domains = impl_->domains.all_domains();
     snap.memberships = impl_->domains.all_memberships();
     snap.evidence = impl_->evidence.all();
+    for (FailureEvent& e : snap.evidence) {
+      if (impl_->cleared_events_.count(e.event_id)) e.status = EvidenceStatus::CLEARED;
+    }
     snap.routes = impl_->routes.all_routes();
     snap.fenced_boots = impl_->fenced_boots;
     snap.has_txn = impl_->has_txn;
@@ -928,23 +1047,51 @@ void FailoverFabric::load(const std::string& path) {
   impl_->fenced_boots = std::move(snap.fenced_boots);
   impl_->slots.clear();
   impl_->slot_index.clear();
+  // Dynamic target evidence and per-slot failback bookkeeping are not durable: targets
+  // register and publish again after recovery.
+  impl_->targets.clear();
   impl_->target_index.clear();
   impl_->targets_by_service.clear();
+  impl_->ready_since.clear();
+  impl_->preferred.clear();
+  impl_->last_transition.clear();
+  impl_->failback_attempts.clear();
+  impl_->manual_failback_authorized.clear();
+  // Identities and generations already used by the recovered state are never issued again.
+  Impl::observe(impl_->authority_alloc, impl_->last_authority_gen);
+  if (snap.pending_assignment) impl_->observe_assignment(*snap.pending_assignment);
+  if (snap.source_assignment) impl_->observe_assignment(*snap.source_assignment);
+  if (snap.pending_route) impl_->observe_route_id(snap.pending_route->route);
   for (Assignment& a : snap.assignments) {
+    impl_->observe_assignment(a);
     Impl::SlotState* st = impl_->find_slot(a.slot);
     if (!st) { impl_->slot_index[a.slot] = impl_->slots.size(); impl_->slots.push_back(Impl::SlotState{a.slot, std::nullopt, {}}); st = &impl_->slots.back(); }
-    if (a.state == AssignmentState::ACTIVE) st->current = std::move(a);
+    // The current assignment of a slot is ACTIVE, or REVALIDATION_REQUIRED once an
+    // interrupted cutover was reconciled; retired assignments are FENCED. A reconciled
+    // current assignment must stay current across a second save and recovery.
+    const bool current_capable = a.state == AssignmentState::ACTIVE ||
+                                 a.state == AssignmentState::REVALIDATION_REQUIRED;
+    if (current_capable && !st->current) st->current = std::move(a);
     else st->history.push_back(std::move(a));
   }
   impl_->domains = DomainRegistry();
   for (DomainDecl& d : snap.domains) impl_->domains.declare(d);
   for (DomainMembership& m : snap.memberships) impl_->domains.set_membership(m);
   impl_->evidence = EvidenceStore();
-  for (FailureEvent& e : snap.evidence) impl_->evidence.publish(std::move(e));
+  impl_->confirmed_failed_targets_.clear();
+  impl_->failed_boot_.clear();
+  impl_->cleared_events_.clear();
+  impl_->domain_failures_.clear();
+  for (FailureEvent& e : snap.evidence) {
+    // Recovered failure evidence keeps excluding its target and domains; a cleared event
+    // stays cleared.
+    if (e.status == EvidenceStatus::CLEARED) impl_->cleared_events_.insert(e.event_id);
+    else impl_->index_failure(e);
+    impl_->evidence.publish(std::move(e));
+  }
   impl_->routes = RouteTable();
-  for (RouteEntry& r : snap.routes) impl_->routes.install(std::move(r));
+  for (RouteEntry& r : snap.routes) { impl_->observe_route_id(r.route); impl_->routes.install(std::move(r)); }
   impl_->routes.mark_revalidation_required();
-  for (Impl::TargetRecord& t : impl_->targets) if (t.facts) { t.facts->ready = false; t.facts->evidence_fresh = false; }
   // Restore the durable interrupted-cutover record.
   impl_->has_txn = snap.has_txn;
   impl_->txn_milestone = snap.txn_milestone;

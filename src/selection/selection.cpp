@@ -1,5 +1,6 @@
 // selection.cpp — Hard eligibility + deterministic ranking.
 #include "failover_fabric/selection.hpp"
+#include "failover_fabric/recovery.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -46,6 +47,22 @@ bool SelectionEngine::hard_eligible(Candidate& c, const ServiceDefinition& svc,
     c.failed_reason = ExclusionReason::FAILED_DOMAIN;
     c.failed_detail = "target has confirmed failure evidence";
     return false;
+  }
+  // 2b. A candidate inside a domain named by confirmed failure evidence is never eligible,
+  // whether or not the service asks for domain independence; unknown membership cannot
+  // establish that it is outside.
+  for (FailureDomainId fd : ctx.failed_domain_evidence) {
+    const auto member = dom.in_domain(c.facts.target, fd);
+    if ((member && *member) || std::find(c.domains.begin(), c.domains.end(), fd) != c.domains.end()) {
+      c.failed_reason = ExclusionReason::FAILED_DOMAIN;
+      c.failed_detail = "candidate is inside a domain with confirmed failure evidence";
+      return false;
+    }
+    if (!member) {
+      c.failed_reason = ExclusionReason::DOMAIN_INDEPENDENCE_UNKNOWN;
+      c.failed_detail = "candidate membership in a failed domain is unknown";
+      return false;
+    }
   }
   // 3. Fenced boot may never be re-authorized as a replacement.
   if (in_list(ctx.fenced_boots, c.facts.worker_boot)) {
@@ -96,6 +113,11 @@ bool SelectionEngine::hard_eligible(Candidate& c, const ServiceDefinition& svc,
       c.failed_detail = "required state is not available or incompatible";
       return false;
     }
+    if (svc.recovery.min_checkpoint_gen && !c.state.checkpoint_generation) {
+      c.failed_reason = ExclusionReason::STATE_TOO_OLD;
+      c.failed_detail = "no checkpoint generation to prove the permitted recovery point";
+      return false;
+    }
     if (svc.recovery.min_checkpoint_gen && c.state.checkpoint_generation) {
       if (*c.state.checkpoint_generation < *svc.recovery.min_checkpoint_gen) {
         c.failed_reason = ExclusionReason::STATE_TOO_OLD;
@@ -106,6 +128,13 @@ bool SelectionEngine::hard_eligible(Candidate& c, const ServiceDefinition& svc,
     if (!c.continuity || *c.continuity == ContinuityClass::UNKNOWN) {
       c.failed_reason = ExclusionReason::UNSUPPORTED_CONTINUITY;
       c.failed_detail = "candidate continuity class is unknown";
+      return false;
+    }
+    // A stateful requirement is never downgraded: the candidate must offer at least the
+    // continuity class the service requires.
+    if (!RecoveryEvaluator::continuity_compatible(required, *c.continuity)) {
+      c.failed_reason = ExclusionReason::UNSUPPORTED_CONTINUITY;
+      c.failed_detail = "candidate continuity class is weaker than the service requires";
       return false;
     }
   }

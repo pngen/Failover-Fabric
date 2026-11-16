@@ -79,6 +79,13 @@ void handle_client(sock c) {
   RouteEntry route; bool have_route = false;
   { std::lock_guard<std::mutex> lk(g_route_mutex); auto it = g_routes.find(slot); if (it != g_routes.end()) { route = it->second; have_route = true; } }
   if (!have_route) { resp.bool_(ex::fid::ok,false); resp.str(ex::fid::detail,"no route installed"); ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish()); net::close_socket(c); return; }
+  // Fail closed unless the installed route is the one the coordinator just authorized: the
+  // same assignment, route generation and worker boot. A route left by another cutover
+  // attempt must not carry work to a target that does not hold the current assignment.
+  if (route.assignment.value() != asg || route.generation.value() != rgen || route.permitted_boot.value() != boot) {
+    resp.bool_(ex::fid::ok,false); resp.str(ex::fid::detail,"installed route does not match the current authority");
+    ex::send_msg(c, MsgType::EXECUTION_RESULT, f->msg_id, g_epoch, resp.finish()); net::close_socket(c); return;
+  }
   bool wok = false; bool withheld = false;
   std::string result = compute_on_worker(route, a, b, wok, withheld);
   // Authorize result with the coordinator. A withheld response (worker closed without a
@@ -133,8 +140,16 @@ int main(int argc, char** argv) {
       if (f->type == MsgType::INSTALL_ROUTE) {
         PayloadReader r(f->payload);
         RouteEntry re = ex::decode_route_entry(r);
-        { std::lock_guard<std::mutex> lk(g_route_mutex); g_routes[re.slot.slot.value()] = re; }
-        PayloadWriter w; w.bool_(ex::fid::ok, true);
+        // A stale route update is rejected: only a strictly newer generation replaces the
+        // route installed for a slot.
+        bool accepted = true;
+        {
+          std::lock_guard<std::mutex> lk(g_route_mutex);
+          auto it = g_routes.find(re.slot.slot.value());
+          if (it != g_routes.end() && re.generation.value() <= it->second.generation.value()) accepted = false;
+          else g_routes[re.slot.slot.value()] = re;
+        }
+        PayloadWriter w; w.bool_(ex::fid::ok, accepted);
         ex::send_msg(ctrl, MsgType::ROUTE_ACK, f->msg_id, f->epoch, w.finish());
       } else if (f->type == MsgType::VERIFY_SERVICE) {
         PayloadReader r(f->payload);

@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <istream>
 
 using namespace failover_fabric;
@@ -507,6 +508,369 @@ FF_TEST(failback_attempt_budget) {
   auto d = fab.evaluate_failback(slot);
   FF_CHECK(!d.authorized);
   FF_CHECK(d.attempts_exhausted);
+}
+
+// ------------------------------------------------------------------------- //
+// Regression tests.
+// ------------------------------------------------------------------------- //
+
+// An in-process adapter that runs a hook inside verify(), i.e. at the point where a
+// competing caller would run: the coordinator holds no lock while it calls the adapter.
+struct HookOps : ff_test::InProcessOps {
+  std::function<void()> on_verify;
+  explicit HookOps(std::string transport) : ff_test::InProcessOps(std::move(transport)) {}
+  VerifyOutcome verify(const RouteEntry& e, const WorkerAuthorization& a) override {
+    if (on_verify) { auto hook = std::move(on_verify); on_verify = nullptr; hook(); }
+    return ff_test::InProcessOps::verify(e, a);
+  }
+};
+
+static bool excluded_for(const SelectionResult& r, TargetId t, ExclusionReason why) {
+  for (const auto& e : r.exclusions) if (e.first == t && e.second.first == why) return true;
+  return false;
+}
+
+FF_TEST(identities_and_generations_are_never_reissued) {
+  FailoverFabric fab;
+  ServiceId sid(20);
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));     // initial assignment (1, generation 1)
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(10), 1);
+  auto p1 = fab.plan_failover(slot);
+  ff_test::InProcessOps ops1("p");
+  AttemptResult r1 = fab.execute_plan(*p1, ops1);
+  FF_CHECK_EQ(r1.state, AttemptState::COMPLETED);
+  const Assignment c1 = *r1.committed_assignment;
+  FF_CHECK(c1.id != AssignmentId(1));                          // the initial assignment's id is not reused
+  // A recovered with a fresh boot; B fails and the service moves again.
+  reg(fab, TargetId(10), WorkerBootId(42));
+  publish_death(fab, TargetId(11), 2);
+  auto p2 = fab.plan_failover(slot);
+  FF_CHECK(p2.has_value());
+  ff_test::InProcessOps ops2("p");
+  AttemptResult r2 = fab.execute_plan(*p2, ops2);
+  FF_CHECK_EQ(r2.state, AttemptState::COMPLETED);
+  const Assignment c2 = *r2.committed_assignment;
+  FF_CHECK(p1->plan != p2->plan);
+  FF_CHECK(r1.attempt != r2.attempt);
+  FF_CHECK(c1.id != c2.id);
+  FF_CHECK(c2.generation > c1.generation);
+  FF_CHECK(c2.activation != c1.activation);
+  FF_CHECK(c2.authority_generation > c1.authority_generation);
+}
+
+FF_TEST(recovered_fabric_issues_fresh_identities) {
+  FailoverFabric fab;
+  ServiceId sid(21);
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(10), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("p");
+  const Assignment before = *fab.execute_plan(*plan, ops).committed_assignment;
+  const std::string path = "identity_state.ff";
+  fab.save(path);
+
+  FailoverFabric recovered;
+  recovered.load(path);
+  std::remove(path.c_str());
+  reg(recovered, TargetId(11), WorkerBootId(11));
+  reg(recovered, TargetId(10), WorkerBootId(42));
+  publish_death(recovered, TargetId(11), 2);
+  auto plan2 = recovered.plan_failover(slot);
+  FF_CHECK(plan2.has_value());
+  ff_test::InProcessOps ops2("p");
+  AttemptResult r = recovered.execute_plan(*plan2, ops2);
+  FF_CHECK_EQ(r.state, AttemptState::COMPLETED);
+  const Assignment after = *r.committed_assignment;
+  FF_CHECK(after.id.value() > before.id.value());
+  FF_CHECK(after.generation > before.generation);
+  FF_CHECK(after.authority_generation > before.authority_generation);
+  for (const Assignment& h : recovered.assignment_history(slot, 100)) FF_CHECK(h.id != after.id);
+}
+
+FF_TEST(competing_cutover_stops_at_the_route_table) {
+  FailoverFabric fab;
+  ServiceId sid(22);
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(10), 1);
+  auto planA = fab.plan_failover(slot);
+  auto planB = fab.plan_failover(slot);          // same source, same requested route generation
+  ff_test::InProcessOps opsB("p");
+  AttemptResult rb;
+  HookOps opsA("p");
+  opsA.on_verify = [&] { rb = fab.execute_plan(*planB, opsB); };   // B runs while A is verifying
+  AttemptResult ra = fab.execute_plan(*planA, opsA);
+  FF_CHECK_EQ(ra.state, AttemptState::COMPLETED);
+  FF_CHECK(rb.state != AttemptState::COMPLETED);
+  FF_CHECK_EQ(opsB.calls_route, 0);              // the loser's route never reaches the gateway
+  FF_CHECK_EQ(opsB.calls_verify, 0);
+  const Assignment cur = *fab.current_assignment(slot);
+  const RouteEntry route = *fab.current_route(slot);
+  FF_CHECK(route.assignment == cur.id);          // the installed route belongs to the committed assignment
+  FF_CHECK(route.generation == cur.route_generation);
+  FF_CHECK_EQ(route.state, RouteState::ACKNOWLEDGED);
+}
+
+// Three independent hosts: current 10, standbys 11 and 12.
+static void setUp_three(FailoverFabric& fab, ServiceId sid, bool independence = true) {
+  ServiceDefinition s = svc_ref(sid);
+  s.domain_requirement.require_domain_independence = independence;
+  fab.create_service(s);
+  fab.declare_domain(DomainDecl{FailureDomainId(1), FailureDomainGeneration::first(), DomainClass::HOST, "h1", std::nullopt, Provenance::SYNTHETIC});
+  fab.declare_domain(DomainDecl{FailureDomainId(3), FailureDomainGeneration::first(), DomainClass::HOST, "h2", std::nullopt, Provenance::SYNTHETIC});
+  fab.declare_domain(DomainDecl{FailureDomainId(5), FailureDomainGeneration::first(), DomainClass::HOST, "h3", std::nullopt, Provenance::SYNTHETIC});
+  fab.set_membership(DomainMembership{TargetId(10), FailureDomainId(1), true});
+  fab.set_membership(DomainMembership{TargetId(11), FailureDomainId(3), true});
+  fab.set_membership(DomainMembership{TargetId(12), FailureDomainId(5), true});
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = key(sid); asg.target = TargetId(10); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(10); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  reg(fab, TargetId(10), WorkerBootId(10));
+  reg(fab, TargetId(11), WorkerBootId(11));
+  reg(fab, TargetId(12), WorkerBootId(12));
+}
+
+FF_TEST(healthy_replay_from_failed_boot_does_not_clear_failure) {
+  FailoverFabric fab;
+  ServiceId sid(23);
+  setUp_three(fab, sid);
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(11), 5, FailureCategory::DEVICE_UNAVAILABLE);
+  // The same boot repeats its healthy observation after the failure was confirmed.
+  fab.publish_candidate_facts(facts(TargetId(11), WorkerBootId(11), true));
+  SelectionResult r = fab.select(slot);
+  FF_CHECK(r.has_selection);
+  FF_CHECK_EQ(r.selected->facts.target, TargetId(12));
+  FF_CHECK(excluded_for(r, TargetId(11), ExclusionReason::FAILED_DOMAIN));
+  // A new incarnation is recovery evidence.
+  fab.publish_candidate_facts(facts(TargetId(11), WorkerBootId(111), true));
+  FF_CHECK_EQ(fab.select(slot).selected->facts.target, TargetId(11));
+}
+
+FF_TEST(cleared_failure_lifts_the_exclusion) {
+  FailoverFabric fab;
+  ServiceId sid(24);
+  setUp_three(fab, sid);
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(11), 5, FailureCategory::DEVICE_UNAVAILABLE);
+  FF_CHECK_EQ(fab.select(slot).selected->facts.target, TargetId(12));
+  fab.clear_failure(FailureEventId(5));
+  FF_CHECK(fab.failures_for(TargetId(11), 10).empty());
+  FF_CHECK_EQ(fab.select(slot).selected->facts.target, TargetId(11));
+}
+
+FF_TEST(fenced_boot_cannot_republish_its_target) {
+  FailoverFabric fab;
+  ServiceId sid(25);
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(10), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("p");
+  FF_CHECK_EQ(fab.execute_plan(*plan, ops).state, AttemptState::COMPLETED);   // boot 10 is fenced
+  FF_REQUIRE_THROW(fab.publish_candidate_facts(facts(TargetId(10), WorkerBootId(10), true)), std::invalid_argument);
+}
+
+FF_TEST(domain_failure_evidence_excludes_members) {
+  FailoverFabric fab;
+  ServiceId sid(26);
+  setUp_three(fab, sid, /*independence=*/false);   // exclusion must not depend on the independence policy
+  ServiceSlotKey slot = key(sid);
+  fab.register_target(TargetId(13), "pipe-13");
+  fab.publish_candidate_facts(facts(TargetId(13), WorkerBootId(13), true));
+  fab.publish_candidate_state(TargetId(13), CandidateState{});
+  fab.publish_candidate_resources(TargetId(13), cpu_ok());
+  fab.set_membership(DomainMembership{TargetId(13), FailureDomainId(3), false});   // membership in h2 unknown
+  // Evidence names the domain h2, not a target.
+  FailureEvent ev; ev.event_id = FailureEventId(7); ev.generation = FailureGeneration::first();
+  ev.status = EvidenceStatus::CONFIRMED; ev.category = FailureCategory::NODE_UNAVAILABLE;
+  ev.domain = FailureDomainId(3); ev.source = SourceId(1); ev.source_boot = SourceBootId(1); ev.received.seq = 7;
+  fab.publish_failure(ev);
+  SelectionResult r = fab.select(slot);
+  FF_CHECK(r.has_selection);
+  FF_CHECK_EQ(r.selected->facts.target, TargetId(12));
+  FF_CHECK(excluded_for(r, TargetId(11), ExclusionReason::FAILED_DOMAIN));
+  FF_CHECK(excluded_for(r, TargetId(13), ExclusionReason::DOMAIN_INDEPENDENCE_UNKNOWN));
+  // The domain failure survives persistence and recovery.
+  const std::string path = "domain_state.ff";
+  fab.save(path);
+  FailoverFabric recovered;
+  recovered.load(path);
+  std::remove(path.c_str());
+  reg(recovered, TargetId(11), WorkerBootId(11));
+  reg(recovered, TargetId(12), WorkerBootId(12));
+  FF_CHECK_EQ(recovered.select(slot).selected->facts.target, TargetId(12));
+  // Clearing the evidence makes the domain's members eligible again.
+  fab.clear_failure(FailureEventId(7));
+  FF_CHECK_EQ(fab.select(slot).selected->facts.target, TargetId(11));
+}
+
+FF_TEST(cleared_failure_stays_cleared_after_recovery) {
+  FailoverFabric fab;
+  ServiceId sid(27);
+  setUp_three(fab, sid);
+  publish_death(fab, TargetId(11), 5, FailureCategory::DEVICE_UNAVAILABLE);
+  publish_death(fab, TargetId(12), 6, FailureCategory::DEVICE_UNAVAILABLE);
+  fab.clear_failure(FailureEventId(6));
+  const std::string path = "cleared_state.ff";
+  fab.save(path);
+  FailoverFabric recovered;
+  recovered.load(path);
+  std::remove(path.c_str());
+  FF_CHECK(!recovered.failures_for(TargetId(11), 10).empty());
+  FF_CHECK(recovered.failures_for(TargetId(12), 10).empty());
+}
+
+FF_TEST(manual_failback_authorization_is_single_use) {
+  FailoverFabric fab;
+  ServiceId sid(28);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.failback = FailbackPolicy::MANUAL;
+  svc.anti_flapping.cooldown_ms = 0; svc.anti_flapping.hysteresis_ms = 0; svc.anti_flapping.max_auto_attempts = 5;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(10); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(10); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  reg(fab, TargetId(10), WorkerBootId(10));
+  reg(fab, TargetId(11), WorkerBootId(11));
+  // Home fails, B takes over, home recovers and the operator authorizes ONE failback.
+  publish_death(fab, TargetId(10), 1);
+  { auto plan = fab.plan_failover(slot); ff_test::InProcessOps ops("p"); FF_CHECK_EQ(fab.execute_plan(*plan, ops).state, AttemptState::COMPLETED); }
+  reg(fab, TargetId(10), WorkerBootId(42));
+  fab.authorize_failback(slot);
+  { ff_test::InProcessOps ops("p"); FF_CHECK_EQ(fab.execute_failback(slot, ops).state, AttemptState::COMPLETED); }
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(10));
+  // Home fails again; B (fresh boot) takes over; home recovers once more.
+  reg(fab, TargetId(11), WorkerBootId(43));
+  publish_death(fab, TargetId(10), 2);
+  { auto plan = fab.plan_failover(slot); FF_CHECK(plan.has_value()); ff_test::InProcessOps ops("p"); FF_CHECK_EQ(fab.execute_plan(*plan, ops).state, AttemptState::COMPLETED); }
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(11));
+  reg(fab, TargetId(10), WorkerBootId(44));
+  // The earlier authorization was spent: a second failback needs a new operator action.
+  auto d = fab.evaluate_failback(slot);
+  FF_CHECK(!d.authorized);
+  FF_CHECK(d.policy_refused);
+  ff_test::InProcessOps ops("p");
+  FF_CHECK(fab.execute_failback(slot, ops).state != AttemptState::COMPLETED);
+  FF_CHECK_EQ(fab.current_assignment(slot)->target, TargetId(11));
+}
+
+FF_TEST(continuity_requirement_is_not_downgraded) {
+  FailoverFabric fab;
+  ServiceId sid(29);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.recovery.continuity = ContinuityClass::CHECKPOINT_RESTORE;
+  svc.domain_requirement.require_domain_independence = false;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(60); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(60); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  CandidateState good;
+  good.state_available = true; good.committed_sequence = 100; good.correct_session = true; good.correct_tenant = true;
+  good.correct_model_generation = true; good.state_format_ok = true; good.status_integrity_ok = true; good.replay_safe = true;
+  CandidateState rebind_only = good; rebind_only.state_generation = StateGeneration(3);        // no checkpoint
+  CandidateState checkpoint = good; checkpoint.checkpoint_generation = CheckpointGeneration(5);
+  reg_stateful(fab, TargetId(61), WorkerBootId(61), rebind_only);
+  reg_stateful(fab, TargetId(62), WorkerBootId(62), checkpoint);
+  publish_death(fab, TargetId(60), 1);
+  SelectionResult r = fab.select(slot);
+  FF_CHECK(r.has_selection);
+  FF_CHECK_EQ(r.selected->facts.target, TargetId(62));
+  FF_CHECK(excluded_for(r, TargetId(61), ExclusionReason::UNSUPPORTED_CONTINUITY));
+}
+
+FF_TEST(recovery_point_requires_a_checkpoint_generation) {
+  FailoverFabric fab;
+  ServiceId sid(30);
+  ServiceDefinition svc = svc_ref(sid);
+  svc.recovery.continuity = ContinuityClass::SESSION_STATE_REBIND;
+  svc.recovery.min_checkpoint_gen = CheckpointGeneration(5);
+  svc.domain_requirement.require_domain_independence = false;
+  fab.create_service(svc);
+  ServiceSlotKey slot{sid, ServiceSlotId(1)};
+  Assignment asg; asg.id = AssignmentId(1); asg.generation = AssignmentGeneration::first();
+  asg.slot = slot; asg.target = TargetId(60); asg.target_generation = TargetGeneration::first();
+  asg.worker_boot = WorkerBootId(60); asg.authority_generation = ServiceAuthorityGeneration::first();
+  asg.state = AssignmentState::ACTIVE;
+  fab.set_initial_assignment(asg);
+  CandidateState st;
+  st.state_available = true; st.correct_session = true; st.correct_tenant = true; st.correct_model_generation = true;
+  st.state_format_ok = true; st.status_integrity_ok = true; st.state_generation = StateGeneration(9);   // no checkpoint generation
+  reg_stateful(fab, TargetId(61), WorkerBootId(61), st);
+  publish_death(fab, TargetId(60), 1);
+  SelectionResult r = fab.select(slot);
+  FF_CHECK(!r.has_selection);
+  FF_CHECK(excluded_for(r, TargetId(61), ExclusionReason::STATE_TOO_OLD));
+}
+
+FF_TEST(persisted_epoch_round_trips) {
+  FailoverFabric fab;
+  ServiceId sid(33);
+  fab.set_coordinator_identity(CoordinatorId(7), 5);          // epoch value differs from the id
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));
+  ServiceSlotKey slot = key(sid);
+  RouteEntry re; re.route = RouteId(1); re.generation = RouteGeneration::first(); re.slot = slot;
+  re.target = TargetId(10); re.epoch = fab.current_epoch();
+  FF_CHECK(fab.install_route(re, GatewayBootId(1)));
+  const std::string path = "epoch_state.ff";
+  fab.save(path);
+  FailoverFabric recovered;
+  recovered.load(path);
+  std::remove(path.c_str());
+  FF_CHECK_EQ(recovered.current_epoch().value(), 5u);
+  FF_CHECK(recovered.current_epoch().id() == CoordinatorId(7));
+  FF_CHECK(recovered.current_epoch() == fab.current_epoch());
+  FF_CHECK(recovered.current_route(slot)->epoch == fab.current_epoch());
+}
+
+FF_TEST(fenced_current_assignment_is_not_reported_available) {
+  FailoverFabric fab;
+  ServiceId sid(31);
+  setUp_independent(fab, sid, TargetId(10), TargetId(11));
+  ServiceSlotKey slot = key(sid);
+  publish_death(fab, TargetId(10), 1);
+  auto plan = fab.plan_failover(slot);
+  ff_test::InProcessOps ops("p"); ops.force_verify_fail = true;
+  FF_CHECK_EQ(fab.execute_plan(*plan, ops).state, AttemptState::RECOVERY_REQUIRED);
+  // The old assignment was fenced and no replacement committed: nothing serves the slot.
+  FF_CHECK_EQ(fab.service_outcome(slot), ServiceOutcome::UNAVAILABLE);
+}
+
+FF_TEST(reconciled_assignment_survives_a_second_recovery) {
+  const std::string ck = "reconcile_ck.ff", ck2 = "reconcile_ck2.ff";
+  ServiceId sid(32);
+  ServiceSlotKey slot = key(sid);
+  {
+    FailoverFabric fab;
+    setUp_independent(fab, sid, TargetId(10), TargetId(11));
+    publish_death(fab, TargetId(10), 1);
+    fab.set_checkpoint_path(ck);
+    fab.set_cutover_barrier(Milestone::INTENT_ONLY);
+    auto plan = fab.plan_failover(slot);
+    ff_test::InProcessOps ops("p");
+    FF_CHECK_EQ(fab.execute_plan(*plan, ops).state, AttemptState::RECOVERY_REQUIRED);   // interrupted + checkpointed
+  }
+  FailoverFabric first;
+  first.load(ck);
+  FF_CHECK(first.current_assignment(slot).has_value());
+  FF_CHECK_EQ(first.current_assignment(slot)->state, AssignmentState::REVALIDATION_REQUIRED);
+  first.save(ck2);                    // e.g. the restarted coordinator persists its advanced epoch
+  FailoverFabric second;
+  second.load(ck2);
+  std::remove(ck.c_str()); std::remove(ck2.c_str());
+  FF_CHECK(second.current_assignment(slot).has_value());
+  FF_CHECK_EQ(second.current_assignment(slot)->target, TargetId(10));
+  FF_CHECK_EQ(second.current_assignment(slot)->state, AssignmentState::REVALIDATION_REQUIRED);
 }
 
 int main() { return ff_test::run_all(); }

@@ -795,6 +795,7 @@ int main(int argc, char** argv) {
   // Coordinator restart reconciliation (on the recovered state).
   // ----------------------------------------------------------------- //
   bool restart_ok = false; bool restart_revalidation = false; bool restart_old_epoch_rejected = false;
+  bool dispatch_refused = false; bool second_epoch_advanced = false;
   {
     const char* state_path = "coord_state.ff";
     { sock c = net::tcp_connect("127.0.0.1", cport); if (c != net::kInvalidSocket) {
@@ -806,18 +807,33 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     Proc coord2 = spawn(exe("ff_coordinator.exe"), {"--port", "0", "--load", state_path});
     std::uint16_t cport2 = read_port(coord2.pipe);
+    std::uint64_t epoch2 = 0;
     if (cport2) {
       QueryResult qs = query_state(cport2, SVC);
+      epoch2 = qs.epoch;
       restart_revalidation = qs.revalidation;
       bool recovered_b = (qs.target == B);
       bool old_epoch_rejected = stale_result_rejected(cport2, SVC, A, 1, 1, 7777);   // old epoch auth
       restart_old_epoch_rejected = old_epoch_rejected;
-      restart_ok = recovered_b && restart_revalidation && old_epoch_rejected;
+      // Until fresh evidence revalidates the recovered route, the gate hands out no new work.
+      { PayloadWriter w; w.u64(ex::fid::service, SVC); w.u64(ex::fid::slot, 1); w.u64(ex::fid::request_id, 9100);
+        MsgType t; std::string d; dispatch_refused = !coord_rpc(cport2, MsgType::AUTHORIZE_REQUEST, w.finish(), t, d); }
+      restart_ok = recovered_b && restart_revalidation && old_epoch_rejected && dispatch_refused;
       kill_proc(coord2);
     }
-    if (cport2) {}  // ensure cport2 is referenced for the recovered_b computation below
-    std::printf("coord_restart revalidation=%s old_epoch_rejected=%s\n",
-      restart_revalidation ? "OK" : "FAIL", restart_old_epoch_rejected ? "OK" : "FAIL");
+    // A second restart from the same file must issue a new epoch, not the one the first
+    // restart already used.
+    if (cport2) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      Proc coord3 = spawn(exe("ff_coordinator.exe"), {"--port", "0", "--load", state_path});
+      std::uint16_t cport3 = read_port(coord3.pipe);
+      if (cport3) second_epoch_advanced = query_state(cport3, SVC).epoch > epoch2;
+      kill_proc(coord3);
+    }
+    restart_ok = restart_ok && second_epoch_advanced;
+    std::printf("coord_restart revalidation=%s old_epoch_rejected=%s dispatch_refused=%s second_restart_epoch_advanced=%s\n",
+      restart_revalidation ? "OK" : "FAIL", restart_old_epoch_rejected ? "OK" : "FAIL",
+      dispatch_refused ? "OK" : "FAIL", second_epoch_advanced ? "OK" : "FAIL");
   }
   bool ok = a_served && promoted && b_served && no_reclaim && new_target == B && stale_rejected && restart_ok;
   std::printf("RESULT %s\n", ok ? "PASS" : "FAIL");

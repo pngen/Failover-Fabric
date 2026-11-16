@@ -210,12 +210,19 @@ void enc_route(std::vector<std::uint8_t>& b, const RouteEntry& e){
 RouteEntry dec_route(Reader& r){
   RouteEntry e; e.route=dec_id<RouteId>(r); e.generation=dec_gen<RouteGeneration>(r); e.slot=dec_slotkey(r); e.target=dec_id<TargetId>(r); e.target_generation=dec_gen<TargetGeneration>(r);
   e.incarnation=dec_id<EngineIncarnationId>(r); e.permitted_boot=dec_id<WorkerBootId>(r); e.assignment=dec_id<AssignmentId>(r); e.assignment_generation=dec_gen<AssignmentGeneration>(r);
-  e.epoch=CoordinatorEpoch(r.u64(), dec_id<CoordinatorId>(r), dec_id<CoordinatorId>(r));
+  { const std::uint64_t ev=r.u64(); const CoordinatorId eid=dec_id<CoordinatorId>(r); const CoordinatorId eboot=dec_id<CoordinatorId>(r); e.epoch=CoordinatorEpoch(ev, eid, eboot); }
   e.gateway_boot=dec_id<GatewayBootId>(r);
   auto st=r.u8(); chk_route(st); e.state=(RouteState)st; e.transport=r.str(); auto pv=r.u8(); chk_prov(pv); e.provenance=(Provenance)pv; return e;
 }
 void enc_epoch(std::vector<std::uint8_t>& b, const CoordinatorEpoch& e){ put_u64(b,e.value()); put_id(b,e.id()); put_id(b,e.boot()); }
-CoordinatorEpoch dec_epoch(Reader& r){ return CoordinatorEpoch(r.u64(), dec_id<CoordinatorId>(r), dec_id<CoordinatorId>(r)); }
+// The three fields are read in separate statements: as arguments of one call their order of
+// evaluation is unspecified, and a right-to-left compiler read the epoch value from the boot.
+CoordinatorEpoch dec_epoch(Reader& r){
+  const std::uint64_t value = r.u64();
+  const CoordinatorId id = dec_id<CoordinatorId>(r);
+  const CoordinatorId boot = dec_id<CoordinatorId>(r);
+  return CoordinatorEpoch(value, id, boot);
+}
 }  // namespace
 // --------------------------------------------------------------------------- //
 // Top-level encode / decode / validate
